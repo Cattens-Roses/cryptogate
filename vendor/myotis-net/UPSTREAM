@@ -1,0 +1,3 @@
+Myotis https://github.com/biafra23/myotis
+Revision: 23c0bcb27c332d38a2cf9f95e9e7cd98dae292a9
+Vendored myotis-net; local changes expose a consensus connection cap and prevent execution dials beyond the configured target. Other components use the pinned upstream revision.

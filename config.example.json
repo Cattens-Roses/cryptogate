@@ -1,0 +1,28 @@
+{
+  "listen": "127.0.0.1:8787",
+  "api_key": "change-me-to-a-long-random-secret",
+  "data_dir": "./payment-data",
+  "vault_password": "change-me-wallet-password",
+  "idle_disconnect_secs": 120,
+  "max_payment_secs": 3600,
+  "networks": {
+    "ltc": {
+      "enabled": true,
+      "payout_address": "ltc1qexamplereplacewithyourownaddress000000",
+      "fee_rate": 10,
+      "max_peers": 3
+    },
+    "btc": {
+      "enabled": false,
+      "payout_address": "bc1qexamplereplacewithyourownaddress000000",
+      "fee_rate": 5,
+      "max_peers": 3
+    },
+    "eth": {
+      "enabled": false,
+      "payout_address": "0x0000000000000000000000000000000000000001",
+      "fee_rate": 30,
+      "max_peers": 3
+    }
+  }
+}

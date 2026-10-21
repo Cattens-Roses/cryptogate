@@ -1,0 +1,14 @@
+/build/
+/testdata/
+/node_modules/
+/package.json
+/package-lock.json
+/.vs/
+/CMakeUserPresets.json
+*.user
+*.suo
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb

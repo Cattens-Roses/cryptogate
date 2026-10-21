@@ -1,0 +1,3718 @@
+//! Scoped, verified log index behind `eth_getLogs` (docs/eth-getlogs-design.md).
+//!
+//! This module is the pure state half of the feature: watch-list config,
+//! the in-memory index, coverage bookkeeping, filter matching, and the
+//! atomic on-disk snapshot. It does no networking and no verification —
+//! callers (the head-follow appender and the backfill walker) only feed it
+//! logs that already passed the anchored-header + receiptsRoot gates, the
+//! same contract as `receipt::DecodedReceipt` ("callers must have already
+//! verified").
+//!
+//! The one load-bearing rule lives in [`LogIndex::query`]: a request outside
+//! indexed coverage is an error, never an empty answer. Wallets read `[]` as
+//! "no events exist"; serving it for an unindexed range would corrupt
+//! event-sourced state (commitment trees) silently and permanently.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// What a watch entry is keyed by — its identity in the watch-list, the
+/// unit `unwatch` names, and what the header bloom is probed for.
+///
+/// - `Address`: one contract — every log it EMITS.
+/// - `Topic` (#673): one 32-byte topic value — every log, from ANY emitter,
+///   that carries it at one of the entry's `positions`. A wallet's own token
+///   history is mostly logs other contracts emit ABOUT it: an ERC-20/721
+///   `Transfer` names it as topic1 or topic2, an ERC-1155 transfer as topic2
+///   or topic3. A header's `logsBloom` accrues each topic as well as the
+///   address, so probing for the value is as selective as probing for an
+///   address, and a miss is just as definitive.
+///
+/// The two never collide: an entry's identity includes its kind, so a topic
+/// value that happens to be a left-padded address is a different entry from
+/// that address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WatchKey {
+    Address([u8; 20]),
+    Topic([u8; 32]),
+}
+
+impl From<[u8; 20]> for WatchKey {
+    fn from(address: [u8; 20]) -> Self {
+        WatchKey::Address(address)
+    }
+}
+
+impl From<[u8; 32]> for WatchKey {
+    fn from(value: [u8; 32]) -> Self {
+        WatchKey::Topic(value)
+    }
+}
+
+impl WatchKey {
+    /// The key's bytes: 20 for an address, 32 for a topic value — what the
+    /// header bloom accrues for it.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            WatchKey::Address(a) => a,
+            WatchKey::Topic(t) => t,
+        }
+    }
+
+    /// The address, for an address entry.
+    pub fn address(&self) -> Option<[u8; 20]> {
+        match self {
+            WatchKey::Address(a) => Some(*a),
+            WatchKey::Topic(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WatchKey {
+    /// `0x` + lowercase hex: 40 digits for an address, 64 for a topic value,
+    /// the same width the config JSON names them with.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x")?;
+        for b in self.as_bytes() {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The topic positions a topic entry may watch: 1 to 3. Position 0 is the
+/// event signature, and "every log of one event, from any emitter" is not a
+/// watch-list, it is a scan of the chain.
+pub const TOPIC_POSITIONS: [u8; 3] = [1, 2, 3];
+
+/// One watch entry: index every log it selects from `from_block` onward —
+/// for an address entry, every log the contract emits; for a topic entry,
+/// every log carrying the value at one of `positions` (see [`WatchKey`]).
+/// `topic0s`, when non-empty, restricts indexing to those event signatures
+/// for either kind — and correspondingly restricts which queries are
+/// answerable (see [`LogIndex::query`]).
+///
+/// `from_block` is the config's assertion that nothing the entry selects
+/// exists below it: a contract's deployment block, or for a topic entry the
+/// first block that can carry the value (a wallet's creation block).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchEntry {
+    pub key: WatchKey,
+    pub from_block: u64,
+    pub topic0s: Vec<[u8; 32]>,
+    /// The topic positions a TOPIC entry matches its value at: strictly
+    /// ascending, non-empty, each in [`TOPIC_POSITIONS`]. Empty for an
+    /// address entry. Part of the entry's restriction, like `topic0s`: a span
+    /// indexed under positions {1, 2} says nothing about logs carrying the
+    /// value at position 3, so a query pinning it there is refused, and two
+    /// sources disagreeing on positions conflict exactly as on `topic0s`.
+    pub positions: Vec<u8>,
+    /// Human-readable label (ENS reverse name or a host-supplied one), purely
+    /// cosmetic: displayed by hosts, carried by the portable v2 snapshot, and
+    /// deliberately EXCLUDED from [`LogIndexConfig::fingerprint`] — renaming
+    /// an entry must never invalidate accumulated coverage. Empty = unnamed.
+    pub name: String,
+}
+
+impl WatchEntry {
+    /// Would this entry store a log at `block_number` emitted by `address`
+    /// with `topics`? The one rule behind indexing, the receipts-only scan
+    /// and merge, so none of them can disagree with another.
+    pub fn selects(&self, block_number: u64, address: &[u8; 20], topics: &[[u8; 32]]) -> bool {
+        block_number >= self.from_block
+            && match self.key {
+                WatchKey::Address(a) => a == *address,
+                WatchKey::Topic(v) => {
+                    self.positions.iter().any(|&p| topics.get(p as usize) == Some(&v))
+                }
+            }
+            && (self.topic0s.is_empty() || topics.first().is_some_and(|t| self.topic0s.contains(t)))
+    }
+
+    /// Same restriction as `other` — equal topic0 sets and equal positions.
+    /// Two entries for one key that differ here describe different log sets,
+    /// so their spans cannot be combined (see [`MergeError::TopicConflict`]).
+    pub fn same_restriction(&self, other: &WatchEntry) -> bool {
+        let mut ta = self.topic0s.clone();
+        let mut tb = other.topic0s.clone();
+        ta.sort_unstable();
+        tb.sort_unstable();
+        ta == tb && self.positions == other.positions
+    }
+
+    /// Whether the positions fit the kind (see [`Self::positions`]).
+    fn positions_valid(&self) -> bool {
+        match self.key {
+            WatchKey::Address(_) => self.positions.is_empty(),
+            WatchKey::Topic(_) => {
+                !self.positions.is_empty()
+                    && self.positions.windows(2).all(|p| p[0] < p[1])
+                    && self.positions.iter().all(|p| TOPIC_POSITIONS.contains(p))
+            }
+        }
+    }
+
+    /// Whether a query pinned by `filter` gets every log it can match from
+    /// this entry's store: for a topic entry the filter must pin the value at
+    /// one of the entry's positions (otherwise it could match logs carrying
+    /// the value elsewhere, or not at all), and for either kind a topic0
+    /// restriction must be honoured by the filter's own topic0. An address
+    /// entry's address match is the caller's (it answers per address).
+    fn answers(&self, filter: &LogFilter) -> bool {
+        let pinned = match self.key {
+            WatchKey::Address(_) => true,
+            WatchKey::Topic(v) => self.positions.iter().any(|&p| filter.pins(p as usize, &v)),
+        };
+        // Topic-restricted entry: only queries pinned to a subset of the
+        // indexed topic0s are answerable — a wildcard would deserve logs we
+        // never stored.
+        pinned
+            && (self.topic0s.is_empty()
+                || filter
+                    .topics
+                    .first()
+                    .is_some_and(|alts| !alts.is_empty() && alts.iter().all(|t| self.topic0s.contains(t))))
+    }
+}
+
+/// The network a snapshot belongs to. Persisted in every v2 file and checked
+/// on load: logs are keyed by block-global `(block_number, log_index)`, so
+/// merging or loading a file from another chain would silently collide keys
+/// and fabricate coverage for blocks nobody verified on THIS chain. The
+/// filename suffix (`logindex-sepolia.db`) is a convention, not a guarantee —
+/// the bytes carry their own identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainTag {
+    /// EL network id (1 mainnet, 11155111 sepolia, 100 gnosis).
+    pub network_id: u64,
+    /// EL genesis block hash — distinguishes forks sharing a network id.
+    pub genesis_hash: [u8; 32],
+}
+
+/// The host-supplied index configuration (crosses the FFI as JSON, parsed
+/// engine-side into this typed form).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogIndexConfig {
+    pub enabled: bool,
+    /// Backfill pacing: `true` = the walker works a multi-batch time budget
+    /// per tick (max download speed); `false` = one batch per tick (nice,
+    /// background). Deliberately NOT part of the fingerprint — flipping it
+    /// must never invalidate accumulated coverage.
+    pub max_speed: bool,
+    /// Backfill OFF switch: `true` = the downward walk does not run at all;
+    /// head-follow and queries are untouched. For a node that serves ONE
+    /// consumer which already owns the history below the index's coverage
+    /// (the Bee PoC: Bee embeds postage events to block 47,061,407 and never
+    /// asks below it), the walk only competes for the snap pool that
+    /// head-follow needs — measured on gnosis: the walk ran at ~1000 blocks/min
+    /// while head-follow managed 3-4.5 against a chain doing 12, so coverage
+    /// fell behind until the consumer's stall timer fired.
+    ///
+    /// Crucially this is NOT the same as raising a watch entry's `from_block`
+    /// to the coverage floor. `from_block` is the config's assertion that the
+    /// contract has no logs below it, so raising it makes a query below the
+    /// floor answer an empty list — a silent lie. Pausing leaves `from_block`
+    /// at the deployment block, so such a query still gets `OutOfCoverage`:
+    /// an honest refusal the caller can act on.
+    ///
+    /// Like [`Self::max_speed`], deliberately NOT part of the fingerprint —
+    /// flipping it must never invalidate accumulated coverage.
+    pub backfill_paused: bool,
+    pub watch: Vec<WatchEntry>,
+}
+
+impl LogIndexConfig {
+    /// Would any watch entry store this log? (Selected by an entry at/past
+    /// its from_block, honoring topic0 restrictions — [`WatchEntry::selects`].)
+    /// Exposed so batch fetchers can pre-filter against a captured config
+    /// snapshot instead of buffering every log of every candidate block.
+    pub fn watches(&self, log: &StoredLog) -> bool {
+        self.watches_parts(log.block_number, &log.address, &log.topics)
+    }
+
+    /// [`Self::watches`] for a log that is not a [`StoredLog`] yet: the three
+    /// things the rule reads. A receipts-only scan asks this before the block's
+    /// body (and so the log's transaction hash) has been fetched at all (#544).
+    /// One rule for both, so the scan and the store cannot disagree.
+    pub fn watches_parts(&self, block_number: u64, address: &[u8; 20], topics: &[[u8; 32]]) -> bool {
+        self.watch.iter().any(|w| w.selects(block_number, address, topics))
+    }
+
+    /// Union this (pushed) config with an already-subscribed watch-list —
+    /// what keeps an imported subscription alive across host preset pushes:
+    /// a host re-applying its shipped preset must EXTEND the stored set, not
+    /// replace it, or every restart would fingerprint-mismatch the imported
+    /// index into a full re-index. Same-key entries take the MIN
+    /// `from_block` (undershooting cannot lie) and the pushed name when
+    /// non-empty (the host is authoritative for cosmetics); keys only
+    /// in `stored` are appended behind the pushed ones. `enabled`/`max_speed`
+    /// come from `self` — they are the push's whole point. None on a
+    /// restriction conflict — topic0s or positions (the caller falls back to
+    /// replace semantics).
+    pub fn union_with(&self, stored: &[WatchEntry]) -> Option<LogIndexConfig> {
+        let mut watch = self.watch.clone();
+        for s in stored {
+            match watch.iter_mut().find(|w| w.key == s.key) {
+                Some(w) => {
+                    if !w.same_restriction(s) {
+                        return None;
+                    }
+                    w.from_block = w.from_block.min(s.from_block);
+                    if w.name.is_empty() && !s.name.is_empty() {
+                        w.name = s.name.clone();
+                    }
+                }
+                None => watch.push(s.clone()),
+            }
+        }
+        Some(LogIndexConfig {
+            enabled: self.enabled,
+            max_speed: self.max_speed,
+            backfill_paused: self.backfill_paused,
+            watch,
+        })
+    }
+
+    /// Why this config cannot be an index's, if it cannot — the ONE reason
+    /// [`LogIndex::new`] refuses a config: a key listed twice, or a topic
+    /// entry's positions out of shape (an address entry with positions at
+    /// all).
+    ///
+    /// Exposed separately so a caller can refuse a bad config at the door,
+    /// before the push has cost anything — before any lock is taken and
+    /// before the live index is touched. `LogIndex::new` sits downstream of
+    /// steps that cannot be undone (`merge` consumes the outgoing index
+    /// outright), so a caller that must leave the installed index intact on a
+    /// refusal asks HERE first (see `ElReader::set_log_index_config`). The
+    /// deserializers ask too: they build `Self` directly, bypassing `new`.
+    pub fn invalid(&self) -> Option<InvalidWatchList> {
+        if let Some(w) = self.watch.iter().find(|w| !w.positions_valid()) {
+            return Some(InvalidWatchList::BadPositions(w.key));
+        }
+        self.watch
+            .iter()
+            .enumerate()
+            .find(|(i, w)| self.watch.iter().skip(i + 1).any(|o| o.key == w.key))
+            .map(|(_, w)| InvalidWatchList::Duplicate(w.key))
+    }
+
+    /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
+    /// on load invalidates the persisted index (derived data — re-index
+    /// rather than risk serving under a stale subscription set).
+    /// `name` is deliberately not encoded: it is cosmetic (see [`WatchEntry`])
+    /// and renaming must not cost a re-index.
+    pub fn fingerprint(&self) -> u64 {
+        // FNV-1a over sorted entry encodings: stable, dependency-free, and
+        // this is a cache-invalidation tag, not a security boundary.
+        let mut encoded: Vec<Vec<u8>> = self
+            .watch
+            .iter()
+            .map(|w| {
+                let mut e = Vec::with_capacity(44 + 32 * w.topic0s.len());
+                // An address entry encodes exactly as before topic entries
+                // existed, so every file and finality claim written by an
+                // earlier build keeps its fingerprint. A topic entry starts
+                // with a marker byte and is never the 28 + 32k bytes long an
+                // address entry is (41 + positions, positions ≤ 3).
+                match w.key {
+                    WatchKey::Address(a) => e.extend_from_slice(&a),
+                    WatchKey::Topic(v) => {
+                        e.push(b'T');
+                        e.extend_from_slice(&v);
+                    }
+                }
+                e.extend_from_slice(&w.from_block.to_le_bytes());
+                e.extend_from_slice(&w.positions);
+                let mut ts = w.topic0s.clone();
+                ts.sort_unstable();
+                for t in ts {
+                    e.extend_from_slice(&t);
+                }
+                e
+            })
+            .collect();
+        encoded.sort_unstable();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in encoded {
+            for b in e {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            // Entry separator so [AB],[C] != [A],[BC].
+            h ^= 0xff;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+}
+
+/// A stored, verified log — the exact tuple the `eth_getLogs` response needs
+/// (field set mirrors the per-log JSON of `eljson::receipt_json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLog {
+    pub block_number: u64,
+    pub block_hash: [u8; 32],
+    pub tx_hash: [u8; 32],
+    pub tx_index: u32,
+    /// Block-global log position (`log_index_base` + offset within the tx).
+    pub log_index: u32,
+    pub address: [u8; 20],
+    pub topics: Vec<[u8; 32]>,
+    pub data: Vec<u8>,
+}
+
+/// Contiguous indexed span, inclusive on both ends. `None` = nothing indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Coverage {
+    pub span: Option<(u64, u64)>,
+}
+
+impl Coverage {
+    pub fn contains(&self, from: u64, to: u64) -> bool {
+        matches!(self.span, Some((low, high)) if low <= from && to <= high)
+    }
+
+    /// Extend upward — only contiguously. A gap would make `contains` claim
+    /// blocks nobody processed, the exact lie this module exists to prevent.
+    fn extend_up(&mut self, block: u64) -> Result<(), CoverageGap> {
+        match self.span {
+            None => self.span = Some((block, block)),
+            Some((low, high)) => {
+                if block > high.saturating_add(1) {
+                    return Err(CoverageGap { edge: high, block });
+                }
+                self.span = Some((low, high.max(block)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Extend downward — only contiguously (see [`Self::extend_up`]).
+    fn extend_down(&mut self, block: u64) -> Result<(), CoverageGap> {
+        match self.span {
+            None => self.span = Some((block, block)),
+            Some((low, high)) => {
+                if block.saturating_add(1) < low {
+                    return Err(CoverageGap { edge: low, block });
+                }
+                self.span = Some((low.min(block), high));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why a watch-list cannot be an index's (see [`LogIndexConfig::invalid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidWatchList {
+    /// The list names this key twice. Query resolution is per key, and two
+    /// entries for one key can desynchronize storage from coverage (a
+    /// coverage-honesty hole).
+    Duplicate(WatchKey),
+    /// A topic entry's positions are empty, out of order, repeated or outside
+    /// 1–3 — or an address entry has positions at all.
+    BadPositions(WatchKey),
+}
+
+impl std::fmt::Display for InvalidWatchList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InvalidWatchList::Duplicate(k) => write!(f, "{k} is listed twice"),
+            InvalidWatchList::BadPositions(k) => write!(
+                f,
+                "{k} has invalid topic positions (a topic entry needs ascending positions \
+                 from 1-3, an address entry none)"
+            ),
+        }
+    }
+}
+
+/// A non-contiguous extend was rejected: the caller tried to record `block`
+/// against a span whose nearest edge is `edge` — the blocks between were
+/// never processed, so bridging them would fabricate coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageGap {
+    pub edge: u64,
+    pub block: u64,
+}
+
+/// A parsed `eth_getLogs` filter (JSON parsing happens engine-side).
+/// `topics` is positional; an empty inner vec is a wildcard position; a
+/// non-empty inner vec is an OR-list, per the RPC spec.
+#[derive(Debug, Clone, Default)]
+pub struct LogFilter {
+    pub from_block: u64,
+    pub to_block: u64,
+    pub addresses: Vec<[u8; 20]>,
+    pub topics: Vec<Vec<[u8; 32]>>,
+}
+
+impl LogFilter {
+    /// Spec matching: every positional constraint must hold; positions beyond
+    /// the log's topic count fail unless the position is a wildcard.
+    pub fn matches(&self, log: &StoredLog) -> bool {
+        if log.block_number < self.from_block || log.block_number > self.to_block {
+            return false;
+        }
+        if !self.addresses.is_empty() && !self.addresses.contains(&log.address) {
+            return false;
+        }
+        for (i, alts) in self.topics.iter().enumerate() {
+            if alts.is_empty() {
+                continue; // wildcard position
+            }
+            match log.topics.get(i) {
+                Some(t) if alts.contains(t) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether the filter pins `position` to exactly `value`: an OR-list
+    /// there whose every alternative is `value`. Only then is every log the
+    /// filter can match one that carries the value at that position.
+    pub fn pins(&self, position: usize, value: &[u8; 32]) -> bool {
+        self.topics
+            .get(position)
+            .is_some_and(|alts| !alts.is_empty() && alts.iter().all(|t| t == value))
+    }
+
+    /// Whether the filter pins some position 1–3 to a single value — the
+    /// only shape a topic entry could answer without an address. A filter
+    /// that pins none can never be served by this index without one.
+    pub fn pins_a_topic(&self) -> bool {
+        pins_a_topic(&self.topics)
+    }
+}
+
+/// [`LogFilter::pins_a_topic`] over a filter's positional `topics` alone, for
+/// a caller that has not built the filter yet.
+pub fn pins_a_topic(topics: &[Vec<[u8; 32]>]) -> bool {
+    topics.iter().skip(1).take(TOPIC_POSITIONS.len()).any(|alts| {
+        alts.first().is_some_and(|v| alts.iter().all(|t| t == v))
+    })
+}
+
+/// Why a query cannot be answered. Every variant maps to a strict
+/// "cannot serve verified right now" error at the RPC layer — retryable
+/// while the index is still catching up, permanent when the filter asks for
+/// something the watch-list will never contain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryError {
+    /// The index is switched off for this network.
+    Disabled,
+    /// An address in the filter is not on the watch-list at all.
+    UnwatchedAddress([u8; 20]),
+    /// The filter names no address, and no topic entry has a value the
+    /// filter pins: nothing on the watch-list selects the logs it asks for.
+    UnwatchedTopic,
+    /// The entry is restricted and the filter steps outside the restriction:
+    /// its topic0 position is a wildcard or asks for an unindexed signature,
+    /// or (a topic entry) it pins the value only at positions the entry does
+    /// not watch.
+    UnindexedTopic(WatchKey),
+    /// The entry is watched but the requested range is not (fully) indexed
+    /// yet. Carries what IS covered so status/errors can say how far along
+    /// the backfill is.
+    OutOfCoverage { key: WatchKey, covered: Coverage },
+    /// Filter is structurally unanswerable (from > to).
+    Unanswerable,
+}
+
+/// The index proper: watch-list, per-entry coverage, and the log store keyed
+/// by (block_number, log_index) so range queries are ordered scans.
+#[derive(Debug, Default)]
+pub struct LogIndex {
+    config: LogIndexConfig,
+    coverage: Vec<Coverage>, // parallel to config.watch
+    logs: BTreeMap<(u64, u32), StoredLog>,
+    /// Backfill cursor: the lowest header verified by the descending walk
+    /// (number, hash) — the trust edge future batches must chain into.
+    pub cursor: Option<(u64, [u8; 32])>,
+}
+
+impl LogIndex {
+    /// Build an empty index. Rejects an invalid watch-list
+    /// ([`LogIndexConfig::invalid`]): query resolution is per key, and two
+    /// entries for one key can desynchronize storage from coverage (a
+    /// coverage-honesty hole).
+    pub fn new(config: LogIndexConfig) -> Result<Self, InvalidWatchList> {
+        if let Some(bad) = config.invalid() {
+            return Err(bad);
+        }
+        let n = config.watch.len();
+        Ok(Self { config, coverage: vec![Coverage::default(); n], logs: BTreeMap::new(), cursor: None })
+    }
+
+    /// Flip the enabled bit without touching accumulated state (used when a
+    /// host re-applies a config whose watch-list fingerprint is unchanged).
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.config.enabled = enabled;
+    }
+
+    /// Swap in `config` while keeping ALL accumulated state — the additive
+    /// re-apply path. Adoptable iff it subscribes exactly this index's
+    /// key set under the same restrictions: then coverage still
+    /// describes every entry (re-paired by key, since order may differ).
+    /// Names and runtime bits ride along. A LOWERED `from_block` adopts too:
+    /// while the walk is mid-descent that is just a deeper target, and when
+    /// it drops below an already-complete span's low (a hole the descending
+    /// walk could never reach — see [`walk_resumable`]) the cursor is
+    /// DROPPED so the appender re-seeds at the top and the walker
+    /// re-descends: coverage survives, the hole closes, nothing wedges.
+    /// False (and untouched state) for a new/removed key or a changed
+    /// restriction — those need a re-index (or a merge).
+    pub fn adopt_config(&mut self, config: LogIndexConfig) -> bool {
+        if config.watch.len() != self.config.watch.len() {
+            return false;
+        }
+        let mut coverage = Vec::with_capacity(config.watch.len());
+        for w in &config.watch {
+            let Some(i) = self.config.watch.iter().position(|o| o.key == w.key) else {
+                return false;
+            };
+            if !w.same_restriction(&self.config.watch[i]) {
+                return false;
+            }
+            coverage.push(self.coverage[i]);
+        }
+        if !walk_resumable(&config.watch, &coverage, self.cursor) {
+            self.cursor = None;
+        }
+        self.config = config;
+        self.coverage = coverage;
+        true
+    }
+
+    /// The explicit unsubscribe: drop every entry in `keys` that this
+    /// index watches — its watch entry, its coverage and every log it stored
+    /// that no surviving entry covers. The other entries keep all of theirs:
+    /// spans are per entry, and a log a dropped entry selected stays exactly
+    /// while a surviving entry both selects it and covers its block (a
+    /// transfer from a watched wallet on a watched token is both entries' log,
+    /// and outlives either one's unwatch) — the rule [`Self::merge`] keeps
+    /// logs by, so nothing is held that no query can reach. A log no dropped
+    /// entry selected is a surviving entry's and is not looked at further,
+    /// which keeps the pass over a large store cheap. A key the index does
+    /// not watch is ignored, which makes a repeated unwatch a no-op. Returns
+    /// how many entries were dropped.
+    ///
+    /// This is the one path by which an entry leaves an index without the
+    /// index being rebuilt: [`LogIndexConfig::union_with`] and [`Self::merge`]
+    /// only ever add.
+    ///
+    /// The cursor stays while the walk can still resume from it
+    /// ([`walk_resumable`]). The surviving entries are a subset of the ones it
+    /// was resumable for, so it goes only when the last covered entry did — a
+    /// cursor with nothing covered above it has nothing to chain into, and the
+    /// appender re-seeds it at the top.
+    ///
+    /// The watch-list fingerprint changes with the entries, which is what
+    /// makes a backfill batch, bridge plan or tail window that was computed
+    /// against the old list discard itself rather than apply.
+    pub fn unwatch(&mut self, keys: &[WatchKey]) -> usize {
+        let watch = std::mem::take(&mut self.config.watch);
+        let coverage = std::mem::take(&mut self.coverage);
+        let mut dropped = Vec::new();
+        for (w, c) in watch.into_iter().zip(coverage) {
+            if keys.contains(&w.key) {
+                dropped.push(w);
+            } else {
+                self.config.watch.push(w);
+                self.coverage.push(c);
+            }
+        }
+        if dropped.is_empty() {
+            return 0;
+        }
+        let (watch, coverage) = (&self.config.watch, &self.coverage);
+        self.logs.retain(|_, l| {
+            let (b, a, t) = (l.block_number, &l.address, &l.topics[..]);
+            !dropped.iter().any(|d| d.selects(b, a, t))
+                || watch.iter().zip(coverage).any(|(w, c)| w.selects(b, a, t) && c.contains(b, b))
+        });
+        if !walk_resumable(&self.config.watch, &self.coverage, self.cursor) {
+            self.cursor = None;
+        }
+        dropped.len()
+    }
+
+    /// Whether `key` has a watch entry here.
+    pub fn watches_key(&self, key: &WatchKey) -> bool {
+        self.config.watch.iter().any(|w| &w.key == key)
+    }
+
+    /// Whether there is anything to follow the head FOR: the index is enabled
+    /// and watches at least one entry. An enabled index with an empty
+    /// watch-list — every contract unwatched, collection left on — covers
+    /// nothing whatever is fetched for it: `append_block` has no entry to
+    /// extend, so the append edge never forms and the appender would read the
+    /// finalized block's receipts again on every tick, for nothing.
+    pub fn follows_head(&self) -> bool {
+        self.config.enabled && !self.config.watch.is_empty()
+    }
+
+    /// Flip the backfill pacing bit without touching accumulated state (same
+    /// fingerprint-unchanged re-apply path as [`Self::set_enabled`]).
+    pub fn set_max_speed(&mut self, max_speed: bool) {
+        self.config.max_speed = max_speed;
+    }
+
+    /// Stop or resume the downward walk. Fingerprint-neutral like
+    /// [`Self::set_max_speed`]: coverage already accumulated survives the flip,
+    /// and resuming continues from the same cursor.
+    pub fn set_backfill_paused(&mut self, paused: bool) {
+        self.config.backfill_paused = paused;
+    }
+
+    pub fn config(&self) -> &LogIndexConfig {
+        &self.config
+    }
+
+    /// Fill in a display name for a watch entry IF it is still unnamed —
+    /// the post-import naming pass. Never overwrites: a name baked into a
+    /// snapshot (or pushed by a host) outranks a late lookup. Cosmetic only
+    /// (names are fingerprint-neutral); persists with the next checkpoint.
+    /// Returns whether anything changed.
+    pub fn set_name(&mut self, key: &WatchKey, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        match self.config.watch.iter_mut().find(|w| &w.key == key) {
+            Some(w) if w.name.is_empty() => {
+                w.name = name.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn coverage_of(&self, key: &WatchKey) -> Option<Coverage> {
+        self.config
+            .watch
+            .iter()
+            .zip(self.coverage.iter())
+            .find(|(w, _)| &w.key == key)
+            .map(|(_, c)| *c)
+    }
+
+    fn watched(&self, log: &StoredLog) -> bool {
+        self.config.watches(log)
+    }
+
+    /// Record a fully processed block adjoining the high edge (the head-follow
+    /// path). `logs` may be empty — coverage still advances, which is what
+    /// makes "no events in this range" a servable answer. All-or-nothing: a
+    /// gap against ANY affected entry rejects the whole call and stores
+    /// nothing — the caller must process the missing blocks first.
+    pub fn append_block(
+        &mut self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        logs: Vec<StoredLog>,
+    ) -> Result<(), CoverageGap> {
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter()) {
+            if block_number >= w.from_block {
+                if let Some((low, high)) = c.span {
+                    if block_number > high.saturating_add(1) || block_number < low {
+                        return Err(CoverageGap { edge: high, block: block_number });
+                    }
+                }
+            }
+        }
+        for log in logs {
+            // Unconditional (not debug_assert): a mislabeled log would be
+            // keyed by its own number, possibly inside covered range it was
+            // never verified for. Drop it instead.
+            if log.block_number != block_number {
+                continue;
+            }
+            if self.watched(&log) {
+                self.logs.insert((log.block_number, log.log_index), log);
+            }
+        }
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter_mut()) {
+            if block_number >= w.from_block {
+                // Pre-checked above; a gap here is unreachable.
+                let _ = c.extend_up(block_number);
+            }
+        }
+        // Seed the backfill trust edge at the first-ever appended block: the
+        // walker chains DOWNWARD from here (backfill_block then advances it).
+        if self.cursor.is_none() {
+            self.cursor = Some((block_number, block_hash));
+        }
+        Ok(())
+    }
+
+    /// Record a fully processed block adjoining the low edge (the backfill
+    /// walk). Caller supplies the verified (number, hash) so the cursor tracks
+    /// the trust edge. Same all-or-nothing gap rule as [`Self::append_block`].
+    pub fn backfill_block(
+        &mut self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        logs: Vec<StoredLog>,
+    ) -> Result<(), CoverageGap> {
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter()) {
+            if block_number >= w.from_block {
+                if let Some((low, high)) = c.span {
+                    if block_number.saturating_add(1) < low || block_number > high {
+                        return Err(CoverageGap { edge: low, block: block_number });
+                    }
+                }
+            }
+        }
+        for log in logs {
+            if log.block_number != block_number {
+                continue; // see append_block: unconditional mislabel guard
+            }
+            if self.watched(&log) {
+                self.logs.insert((log.block_number, log.log_index), log);
+            }
+        }
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter_mut()) {
+            if block_number >= w.from_block {
+                let _ = c.extend_down(block_number);
+            }
+        }
+        self.cursor = Some((block_number, block_hash));
+        Ok(())
+    }
+
+    /// Drop everything above `fork_point` (exclusive) after a reorg above
+    /// finalized. Coverage highs pull back; logs of orphaned blocks go away.
+    pub fn rewind_above(&mut self, fork_point: u64) {
+        // The backfill trust edge is a HASH; if the reorg reaches below it,
+        // that hash may name an orphaned block — a resuming walker would
+        // parent-chain into the dead branch. Drop it; the caller re-anchors.
+        if self.cursor.is_some_and(|(n, _)| n > fork_point) {
+            self.cursor = None;
+        }
+        self.logs.retain(|(bn, _), _| *bn <= fork_point);
+        for c in &mut self.coverage {
+            if let Some((low, high)) = c.span {
+                if high > fork_point {
+                    c.span = if low > fork_point { None } else { Some((low, fork_point)) };
+                }
+            }
+        }
+    }
+
+    /// Answer `eth_getLogs`, enforcing coverage honesty (see module docs).
+    ///
+    /// Two ways a filter is answerable:
+    ///
+    /// - A TOPIC entry whose value the filter pins at one of the entry's
+    ///   positions answers it whole, whatever the filter's address list (none,
+    ///   one token, several): every log the filter can match carries the value
+    ///   there, and inside the entry's coverage every such log is stored.
+    /// - Otherwise every address the filter names must be an address entry
+    ///   covering the range — the filter's logs all come from those addresses.
+    ///
+    /// Either way the scan returns every stored log in range the filter
+    /// matches, whichever entry stored it: a log one entry selected and
+    /// another did not is still a verified log the filter asked for.
+    pub fn query(&self, filter: &LogFilter) -> Result<Vec<StoredLog>, QueryError> {
+        if !self.config.enabled {
+            return Err(QueryError::Disabled);
+        }
+        if filter.from_block > filter.to_block {
+            return Err(QueryError::Unanswerable);
+        }
+        // The topic entries first. A refusal from one is kept to explain
+        // the answer if nothing else serves — a covered-but-not-yet span is
+        // the most useful (the caller can wait it out), so it wins.
+        let mut topic_refusal: Option<QueryError> = None;
+        for (w, cov) in self.config.watch.iter().zip(self.coverage.iter()) {
+            let WatchKey::Topic(v) = w.key else {
+                continue;
+            };
+            if !w.answers(filter) {
+                // Pinned, but where this entry does not look, or outside its
+                // topic0 restriction: the entry exists for the value and
+                // cannot serve this shape of question.
+                if (1..filter.topics.len()).any(|p| filter.pins(p, &v)) && topic_refusal.is_none() {
+                    topic_refusal = Some(QueryError::UnindexedTopic(w.key));
+                }
+                continue;
+            }
+            match Self::check_coverage(w, cov, filter) {
+                Ok(()) => return Ok(self.scan(filter)),
+                Err(e) => topic_refusal = Some(e),
+            }
+        }
+        if filter.addresses.is_empty() {
+            return Err(topic_refusal.unwrap_or(QueryError::UnwatchedTopic));
+        }
+        let address_refusal = |e: QueryError| match topic_refusal.clone() {
+            Some(t @ QueryError::OutOfCoverage { .. }) => t,
+            _ => e,
+        };
+        for addr in &filter.addresses {
+            let Some((w, cov)) = self
+                .config
+                .watch
+                .iter()
+                .zip(self.coverage.iter())
+                .find(|(w, _)| w.key == WatchKey::Address(*addr))
+            else {
+                return Err(address_refusal(QueryError::UnwatchedAddress(*addr)));
+            };
+            if !w.answers(filter) {
+                return Err(address_refusal(QueryError::UnindexedTopic(w.key)));
+            }
+            Self::check_coverage(w, cov, filter).map_err(address_refusal)?;
+        }
+        Ok(self.scan(filter))
+    }
+
+    /// Only the part of the range at/after the entry's from_block must
+    /// be covered — below it the entry selects no log by config, which the
+    /// config itself asserts (deployment block, wallet creation).
+    fn check_coverage(w: &WatchEntry, cov: &Coverage, filter: &LogFilter) -> Result<(), QueryError> {
+        let need_from = filter.from_block.max(w.from_block);
+        if need_from <= filter.to_block && !cov.contains(need_from, filter.to_block) {
+            return Err(QueryError::OutOfCoverage { key: w.key, covered: *cov });
+        }
+        Ok(())
+    }
+
+    fn scan(&self, filter: &LogFilter) -> Vec<StoredLog> {
+        self.logs
+            .range((filter.from_block, 0)..=(filter.to_block, u32::MAX))
+            .map(|(_, l)| l)
+            .filter(|l| filter.matches(l))
+            .cloned()
+            .collect()
+    }
+
+    pub fn log_count(&self) -> usize {
+        self.logs.len()
+    }
+
+    /// The next block the head-follow appender should record: one past the
+    /// highest covered block across entries, or None when nothing is indexed
+    /// yet (the appender then starts fresh at the current head).
+    /// Invariant making `max` safe here: append_block extends every
+    /// at-or-past-from_block entry together and rewind_above pulls highs to
+    /// a common fork point, so all `Some` highs are equal at rest; an entry
+    /// below the max is either pre-from_block or `None` (backfill's job).
+    pub fn append_edge(&self) -> Option<u64> {
+        self.coverage
+            .iter()
+            .filter_map(|c| c.span.map(|(_, high)| high))
+            .max()
+            .map(|h| h.saturating_add(1))
+    }
+
+    /// Bloom pre-filter for one block: could its header bloom contain a log
+    /// any watch entry would store? `false` is a definitive skip (blooms
+    /// have no false negatives); `true` still requires verified receipts.
+    /// Entries whose `from_block` is above `block_number` are ignored, and
+    /// a topic0-restricted entry requires its key AND one of its topic0s.
+    /// A topic entry probes for its value: the bloom accrues every topic of
+    /// every log, whatever its position.
+    pub fn bloom_may_match(&self, block_number: u64, bloom: &myotis_core::bloom::LogsBloom) -> bool {
+        self.config.watch.iter().any(|w| {
+            block_number >= w.from_block
+                && myotis_core::bloom::may_contain(bloom, w.key.as_bytes())
+                && (w.topic0s.is_empty()
+                    || w.topic0s.iter().any(|t| myotis_core::bloom::may_contain(bloom, t)))
+        })
+    }
+
+    /// Watch entries paired with their coverage — the status surface.
+    pub fn coverage_entries(&self) -> Vec<(WatchEntry, Coverage)> {
+        self.config.watch.iter().cloned().zip(self.coverage.iter().copied()).collect()
+    }
+
+    /// Lowest `from_block` among entries whose coverage has NOT yet reached
+    /// it — where the descending walk actually stops. `None` = nothing left
+    /// to walk.
+    ///
+    /// This is deliberately not the same value as `target_low` (the lowest
+    /// `from_block` over EVERY entry, complete or not — the figure hosts
+    /// display as `targetLow`): two entries can legitimately share a
+    /// `from_block` (nothing but the key is checked for duplicates, see
+    /// [`LogIndexConfig::invalid`]) while only one of them is
+    /// actually done, and a newly added entry can sit above the walker's
+    /// current frontier with no span at all yet. Filtering to "whichever
+    /// entry happens to own `target_low`" would get both wrong; this scans
+    /// every entry's own `low <= w.from_block` — the same per-entry "done"
+    /// check `walk_resumable` makes — and reports the lowest point among the
+    /// ones still short of it.
+    ///
+    /// This exists because `cursor` alone is not a reliable "how much
+    /// backfill is left" signal: [`Self::append_block`] seeds it at the FIRST
+    /// block it ever appends, not at any entry's `from_block`. For an index
+    /// built from a bundled or imported seed — which ships no cursor of its
+    /// own (`scripts/synth_logindex.py`'s own comment: "the appender re-seeds
+    /// the walker's trust edge itself") — that first append lands wherever
+    /// head-follow happens to be, far above every `from_block`, and nothing
+    /// ever pulls it back down while backfill stays paused (or simply hasn't
+    /// run yet). Two real consumers both need the true stopping point instead
+    /// of the naive `cursor - target_low` distance: the hosts' `blocksRemaining`
+    /// status figure (`myotis-engine::host::build_log_index_status`), which
+    /// reported the full historical span as still needing a walk for an index
+    /// that was serving every one of those blocks (and, before this method
+    /// existed, still overcounted as soon as any one entry was incomplete);
+    /// and this crate's own backfill scheduler (`el::reader`'s
+    /// `log_index_backfill_round`, via `backfill_round_has_work`), which would
+    /// otherwise spend a real batch fetch-and-verify round re-walking a range
+    /// it already fully covers.
+    pub fn walk_target(&self) -> Option<u64> {
+        self.config
+            .watch
+            .iter()
+            .zip(self.coverage.iter())
+            .filter(|(w, c)| !c.span.is_some_and(|(low, _)| low <= w.from_block))
+            .map(|(w, _)| w.from_block)
+            .min()
+    }
+
+    /// True once EVERY watch entry's coverage has reached its own
+    /// `from_block` — the descending backfill walk has nothing left to do for
+    /// any of them, independent of where [`Self::cursor`] happens to sit. An
+    /// empty watch list is vacuously NOT complete: there is nothing to report
+    /// on, and a caller asking "is there nothing left to do" about no entries
+    /// at all almost certainly has a bug of its own.
+    pub fn backfill_complete(&self) -> bool {
+        !self.config.watch.is_empty() && self.walk_target().is_none()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence: a versioned framed blob, written atomically (temp + rename,
+// the sync-state snapshot pattern). The index is derived data: any load
+// problem — bad magic, unknown version, truncation, fingerprint mismatch —
+// yields None and the caller re-indexes. Never correctness-critical.
+// ---------------------------------------------------------------------------
+
+/// The scratch path one [`write_atomic`] call writes through before renaming
+/// it into place. Distinct for every CALL, not merely every process: two
+/// writers in one process aiming at the same `path` would otherwise share a
+/// temp file, and the loser's `File::create` truncates the winner's mid-write —
+/// or worse, the winner renames the shared temp out from under the loser, whose
+/// still-open fd then keeps writing into the LIVE `.db` that readers are
+/// reading. That was invisible while every caller happened to hold the index
+/// mutex across the whole write; it stops being invisible the moment one of
+/// them doesn't. Separate from `write_atomic` so the distinctness can be
+/// asserted directly instead of only being raced for.
+fn next_tmp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
+}
+
+/// Write `bytes` to `path` atomically: private temp file, fsync, rename, then
+/// fsync the parent directory so the rename itself survives a power loss.
+/// The one place the log-index snapshot pattern lives, so every writer of an
+/// index `.db` gets the same durability, and so a caller can serialize under
+/// whatever lock owns the index and then do the slow part — the fsync —
+/// without holding it. (Other snapshot writers in the tree — `sync.rs`, roost
+/// — keep their own; this is not a repo-wide primitive.)
+///
+/// The temp name comes from [`next_tmp_path`] — see there for why a per-call
+/// counter, and not just the pid, is what makes two concurrent writers safe.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = next_tmp_path(path);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    };
+    if let Err(e) = write() {
+        // A partial temp is dead weight at full snapshot size, and the likely
+        // trigger is ENOSPC — leaving it behind is what keeps the disk full.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Same reasoning, and here the temp is FULL size: a failed rename
+        // (EACCES, EROFS, a dataDir symlinked across filesystems) would
+        // otherwise leave a whole snapshot behind on every attempt.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Best-effort: a rename is not durable until the directory entry is. If
+    // this fails the old checkpoint is still what a crash would find, which is
+    // the same safe degradation as no checkpoint at all.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+const MAGIC: &[u8; 4] = b"MLIX";
+/// v1: config-keyed blob (fingerprint only — unreadable without the exact
+///     watch-list that produced it; still LOADED for upgrade, never written).
+/// v2: self-describing — adds the chain tag and the full watch-table
+///     (address, from_block, topic0s, name), so a file can be imported on a
+///     host that has never seen its config, and cannot cross networks.
+/// v3: v2 whose watch-table entries each open with a kind byte — 0 for an
+///     address entry (then exactly v2's fields), 1 for a topic entry (#673:
+///     value(32), from_block, positions, topic0s, name). Written ONLY when
+///     the index holds a topic entry: an address-only index stays v2 byte
+///     for byte, so its files, exports and finality claims still read on
+///     builds (and tools — `scripts/synth_logindex.py`) that predate v3.
+const VERSION: u32 = 2;
+const VERSION_TOPICS: u32 = 3;
+const VERSION_LEGACY: u32 = 1;
+
+/// Watch-table kind bytes of a v3 frame.
+const KIND_ADDRESS: u8 = 0;
+const KIND_TOPIC: u8 = 1;
+
+/// Byte offset of the v2 checksum field (v3 shares the header): magic(4) + version(4) +
+/// network_id(8) + genesis_hash(32) + fingerprint(8). The checksum covers
+/// everything AFTER itself.
+const V2_CHECKSUM_AT: usize = 56;
+/// v1 layout: magic(4) + version(4) + fingerprint(8).
+const V1_CHECKSUM_AT: usize = 16;
+
+/// FNV-1a (same primitive as the config fingerprint): integrity tag for the
+/// snapshot payload — bit-rot detection, not a security boundary.
+fn fnv64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+
+struct Cursor<'a> {
+    d: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.d.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        self.take(4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes)
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        self.take(8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes)
+    }
+
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
+
+    fn arr<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N).and_then(|b| b.try_into().ok())
+    }
+}
+
+impl LogIndex {
+    /// Serialize with coverage and logs CLAMPED at `max_block`: everything
+    /// above it is left out of the file entirely. Used to keep optimistic
+    /// (above-finality) coverage out of checkpoints — that coverage is only
+    /// verifiable against the in-memory tail record, which does not survive a
+    /// restart, so persisting it would leave a later run holding coverage it
+    /// can never re-check.
+    pub fn serialize_clamped(&self, tag: &ChainTag, max_block: u64) -> Vec<u8> {
+        self.serialize_with_clamp(tag, Some(max_block))
+    }
+
+    /// [`Self::persist`] with the same clamp as [`Self::serialize_clamped`].
+    pub fn persist_clamped(&self, tag: &ChainTag, path: &Path, max_block: u64) -> std::io::Result<()> {
+        write_atomic(path, &self.serialize_clamped(tag, max_block))
+    }
+
+    pub fn serialize(&self, tag: &ChainTag) -> Vec<u8> {
+        self.serialize_with_clamp(tag, None)
+    }
+
+    /// Export as a portable snapshot with the display names STRIPPED — the
+    /// generator's output path. Naming is the IMPORTING wallet's job (owner
+    /// decision, 2026-08-14), but the naming pass runs wherever an index is
+    /// enabled — a long-running generator daemon would otherwise bake its
+    /// own resolutions into the file and, since `set_name` fills only EMPTY
+    /// names, become authoritative for every importer. Blanked at write
+    /// time, never by cloning the (possibly GB-scale) store. `clamp` as in
+    /// [`Self::persist_clamped`] (None = unclamped, the zero-finality case).
+    pub fn export_unnamed(
+        &self,
+        tag: &ChainTag,
+        path: &Path,
+        clamp: Option<u64>,
+    ) -> std::io::Result<()> {
+        write_atomic(path, &self.serialize_impl(tag, clamp, true))
+    }
+
+    fn serialize_with_clamp(&self, tag: &ChainTag, clamp: Option<u64>) -> Vec<u8> {
+        self.serialize_impl(tag, clamp, false)
+    }
+
+    /// The one serializer (VERSION 2, or 3 when a topic entry needs it).
+    /// `clamp` bounds what is
+    /// written (see [`Self::serialize_clamped`]) and filters DURING the
+    /// write: the tail keeps coverage above finality at all times, so a clamp
+    /// that cloned the index would deep-copy the whole log store on every
+    /// checkpoint, under the index lock, on a 10s cadence. `strip_names`
+    /// blanks the watch-table names (see [`Self::export_unnamed`]).
+    fn serialize_impl(&self, tag: &ChainTag, clamp: Option<u64>, strip_names: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128 + self.logs.len() * 200);
+        let v3 = self.config.watch.iter().any(|w| matches!(w.key, WatchKey::Topic(_)));
+        out.extend_from_slice(MAGIC);
+        put_u32(&mut out, if v3 { VERSION_TOPICS } else { VERSION });
+        put_u64(&mut out, tag.network_id);
+        out.extend_from_slice(&tag.genesis_hash);
+        put_u64(&mut out, self.config.fingerprint());
+        put_u64(&mut out, 0); // checksum placeholder, patched below
+        // The watch-table, in config order (coverage below is parallel to
+        // it): what makes the file self-describing — an importer reconstructs
+        // the subscription set from the bytes instead of needing the exact
+        // config that produced them.
+        put_u32(&mut out, self.config.watch.len() as u32);
+        for w in &self.config.watch {
+            match w.key {
+                WatchKey::Address(a) => {
+                    if v3 {
+                        out.push(KIND_ADDRESS);
+                    }
+                    out.extend_from_slice(&a);
+                    put_u64(&mut out, w.from_block);
+                }
+                WatchKey::Topic(v) => {
+                    out.push(KIND_TOPIC);
+                    out.extend_from_slice(&v);
+                    put_u64(&mut out, w.from_block);
+                    put_bytes(&mut out, &w.positions);
+                }
+            }
+            put_u32(&mut out, w.topic0s.len() as u32);
+            for t in &w.topic0s {
+                out.extend_from_slice(t);
+            }
+            put_bytes(&mut out, if strip_names { b"" } else { w.name.as_bytes() });
+        }
+        // Coverage spans + cursor.
+        put_u32(&mut out, self.coverage.len() as u32);
+        for c in &self.coverage {
+            // A span whose LOW is above the clamp disappears entirely; one
+            // that straddles it is written with the clamped high.
+            let span = match (c.span, clamp) {
+                (Some((low, _)), Some(max)) if low > max => None,
+                (Some((low, high)), Some(max)) => Some((low, high.min(max))),
+                (span, _) => span,
+            };
+            match span {
+                None => out.push(0),
+                Some((low, high)) => {
+                    out.push(1);
+                    put_u64(&mut out, low);
+                    put_u64(&mut out, high);
+                }
+            }
+        }
+        // The cursor is a HASH: above the clamp it may name a block that was
+        // never re-checked (or was orphaned), and a reloading walker would
+        // parent-chain into it. Drop it rather than persist it — the appender
+        // re-seeds the trust edge on its first append.
+        let cursor = match (self.cursor, clamp) {
+            (Some((n, _)), Some(max)) if n > max => None,
+            (cursor, _) => cursor,
+        };
+        match cursor {
+            None => out.push(0),
+            Some((n, h)) => {
+                out.push(1);
+                put_u64(&mut out, n);
+                out.extend_from_slice(&h);
+            }
+        }
+        // Logs (the clamped range is a prefix of the key order, so this is a
+        // bounded scan rather than a filtered copy).
+        let clamped_logs: Vec<&StoredLog> = match clamp {
+            None => self.logs.values().collect(),
+            Some(max) => self.logs.range(..=(max, u32::MAX)).map(|(_, l)| l).collect(),
+        };
+        put_u64(&mut out, clamped_logs.len() as u64);
+        for log in clamped_logs {
+            put_u64(&mut out, log.block_number);
+            out.extend_from_slice(&log.block_hash);
+            out.extend_from_slice(&log.tx_hash);
+            put_u32(&mut out, log.tx_index);
+            put_u32(&mut out, log.log_index);
+            out.extend_from_slice(&log.address);
+            put_u32(&mut out, log.topics.len() as u32);
+            for t in &log.topics {
+                out.extend_from_slice(t);
+            }
+            put_bytes(&mut out, &log.data);
+        }
+        // Payload checksum over everything after the checksum field itself:
+        // structural framing catches truncation, this catches bit-rot inside
+        // otherwise-valid frames — either way a bad load means re-index, never
+        // serving corrupted logs as verified.
+        let sum = fnv64(&out[V2_CHECKSUM_AT + 8..]);
+        if let Some(slot) = out.get_mut(V2_CHECKSUM_AT..V2_CHECKSUM_AT + 8) {
+            slot.copy_from_slice(&sum.to_le_bytes());
+        }
+        out
+    }
+
+    /// Rebuild from bytes for the given config. Any mismatch or corruption
+    /// → None (re-index). Accepts the current v2/v3 layouts (tag-checked) and the
+    /// legacy v1 layout (pre-tag files written by earlier builds — loading
+    /// them preserves accumulated coverage across the upgrade; the next
+    /// checkpoint rewrites the file as v2).
+    pub fn deserialize(config: &LogIndexConfig, tag: &ChainTag, data: &[u8]) -> Option<Self> {
+        let mut c = Cursor { d: data, pos: 0 };
+        if c.take(4)? != MAGIC {
+            return None;
+        }
+        match c.u32()? {
+            VERSION_LEGACY => Self::deserialize_v1(config, data, c),
+            version @ (VERSION | VERSION_TOPICS) => {
+                let parsed = parse_v2(data, c, version)?;
+                if parsed.tag != *tag || parsed.fingerprint != config.fingerprint() {
+                    return None;
+                }
+                // The file's coverage vec parallels the file's watch order;
+                // the given config may list the same set in another order
+                // (the fingerprint is order-insensitive). Re-pair coverage by
+                // KEY so a reordered-but-equal config cannot attach a
+                // span to the wrong entry. The config (not the file) supplies
+                // the names — the host is authoritative for cosmetics.
+                let mut coverage = Vec::with_capacity(config.watch.len());
+                for w in &config.watch {
+                    let j = parsed.watch.iter().position(|f| f.key == w.key)?;
+                    coverage.push(parsed.coverage[j]);
+                }
+                // Same bar as `new`: a duplicate key desynchronizes
+                // storage from coverage, and this path builds `Self` directly.
+                // Reachable with a hand-written config, since the fingerprint
+                // the file is keyed by is computed from that same config.
+                config.invalid().is_none().then(|| Self {
+                    config: config.clone(),
+                    coverage,
+                    logs: parsed.logs,
+                    cursor: parsed.cursor,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The legacy (v1) layout: fingerprint-keyed, no chain tag, no
+    /// watch-table, coverage parallel to the SUPPLIED config's order.
+    fn deserialize_v1(config: &LogIndexConfig, data: &[u8], mut c: Cursor) -> Option<Self> {
+        if c.u64()? != config.fingerprint() {
+            return None;
+        }
+        let stored_sum = c.u64()?;
+        if fnv64(data.get(V1_CHECKSUM_AT + 8..)?) != stored_sum {
+            return None;
+        }
+        let n_cov = c.u32()? as usize;
+        if n_cov != config.watch.len() {
+            return None;
+        }
+        let (coverage, cursor, logs) = parse_body(&mut c, n_cov)?;
+        if c.pos != data.len() {
+            return None; // trailing garbage → treat as corrupt
+        }
+        // Same bar as `new` (see `deserialize`).
+        config.invalid().is_none().then(|| Self { config: config.clone(), coverage, logs, cursor })
+    }
+
+    /// Self-describing read (v2/v3): reconstruct the subscription set from
+    /// the file's own watch-table instead of requiring the config that wrote
+    /// it — the import path. Returns the file's chain tag so the importer can
+    /// refuse a file from another network, and the index carrying the file's
+    /// watch entries (names included) with `enabled`/`max_speed` false: those
+    /// are runtime bits the receiving host decides, never file content.
+    pub fn deserialize_portable(data: &[u8]) -> Option<(ChainTag, Self)> {
+        Self::deserialize_portable_with_id(data).map(|(ix, id)| (id.tag, ix))
+    }
+
+    /// [`Self::deserialize_portable`], plus the [`SnapshotId`] of the bytes it
+    /// read — so a caller can match a finality claim against the very file it
+    /// loaded. Reading the header a second time could see a different file.
+    pub fn deserialize_portable_with_id(data: &[u8]) -> Option<(Self, SnapshotId)> {
+        let mut c = Cursor { d: data, pos: 0 };
+        if c.take(4)? != MAGIC {
+            return None;
+        }
+        let version = c.u32()?;
+        if version != VERSION && version != VERSION_TOPICS {
+            return None; // v1 files are not self-describing — not importable
+        }
+        let parsed = parse_v2(data, c, version)?;
+        let config =
+            LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: parsed.watch };
+        // The stored fingerprint must actually match the stored watch-table —
+        // a mismatch means the frame is inconsistent with itself.
+        if parsed.fingerprint != config.fingerprint() {
+            return None;
+        }
+        let id = SnapshotId { tag: parsed.tag, fingerprint: parsed.fingerprint, checksum: parsed.checksum };
+        let ix = Self::new(config).ok()?;
+        Some((Self { coverage: parsed.coverage, logs: parsed.logs, cursor: parsed.cursor, ..ix }, id))
+    }
+
+    /// [`Self::deserialize_portable`] from a file.
+    pub fn load_portable(path: &Path) -> Option<(ChainTag, Self)> {
+        let data = std::fs::read(path).ok()?;
+        Self::deserialize_portable(&data)
+    }
+
+    /// [`Self::deserialize_portable_with_id`] from a file.
+    pub fn load_portable_with_id(path: &Path) -> Option<(Self, SnapshotId)> {
+        let data = std::fs::read(path).ok()?;
+        Self::deserialize_portable_with_id(&data)
+    }
+
+    /// Does `path` hold a LEGACY (v1) snapshot? Distinguishes "not portable
+    /// because it predates the self-describing format" (real accumulated
+    /// coverage — refuse to overwrite it) from "not portable because it's
+    /// corrupt" (dead bytes — safe to replace). Only the frame header is
+    /// read.
+    pub fn is_legacy_snapshot(path: &Path) -> bool {
+        let mut header = [0u8; 8];
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return false;
+        };
+        use std::io::Read as _;
+        if f.read_exact(&mut header).is_err() {
+            return false;
+        }
+        header[..4] == *MAGIC && u32::from_le_bytes([header[4], header[5], header[6], header[7]]) == VERSION_LEGACY
+    }
+
+    /// Atomic best-effort persist: temp file (named per CALL — see
+    /// `next_tmp_path`) + rename, the `persist_snapshot` pattern. A failed
+    /// write costs a re-index on the affected range, never correctness.
+    pub fn persist(&self, tag: &ChainTag, path: &Path) -> std::io::Result<()> {
+        write_atomic(path, &self.serialize(tag))
+    }
+
+    /// Load a persisted index for `config`; None on absence or any mismatch.
+    pub fn load(config: &LogIndexConfig, tag: &ChainTag, path: &Path) -> Option<Self> {
+        let data = std::fs::read(path).ok()?;
+        Self::deserialize(config, tag, &data)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finality claim: a sidecar beside the index (`<index>.final`) recording, for
+// ONE exact file, the finality its writer clamped it at. The index file alone
+// cannot say whether its top is final: a restart restores the beacon store from
+// a snapshot that is rewritten only once per sync-committee period, so the
+// anchor's first finality can trail the checkpoint by hours, and coverage
+// between the two looks exactly like an optimistic tail nobody can re-check.
+//
+// Deliberately NOT part of the portable format. The portable file is what gets
+// exported, imported and dropped into the data dir, and a claim must never
+// travel with it: it says "THIS NODE's light client had verified finality at
+// this height when it wrote these bytes", which no other file can say. So a
+// claim counts only for the exact bytes it was written beside (`SnapshotId`),
+// and only the reader's own checkpoint path writes one.
+// ---------------------------------------------------------------------------
+
+/// The contents of one v2 snapshot file, as far as a finality claim needs to
+/// know: chain tag and config fingerprint from the header, plus the payload
+/// checksum, which covers everything after it. A replaced file — a drop-in, an
+/// import, another build's write — has a different id, so an old claim no
+/// longer applies to it.
+///
+/// The checksum is FNV-1a, an integrity tag rather than a MAC: this guards
+/// against accidents, not adversaries — anyone who can replace the index in
+/// the data dir can replace the sidecar too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotId {
+    pub tag: ChainTag,
+    pub fingerprint: u64,
+    pub checksum: u64,
+}
+
+impl SnapshotId {
+    /// The id of a serialized v2/v3 frame, read off its header — for a writer
+    /// that holds the bytes it is about to put on disk (it produced them, so
+    /// the checksum is not re-verified). `None` for anything but such a frame.
+    pub fn of_frame(bytes: &[u8]) -> Option<SnapshotId> {
+        let mut c = Cursor { d: bytes, pos: 0 };
+        if c.take(4)? != MAGIC || !matches!(c.u32()?, VERSION | VERSION_TOPICS) {
+            return None;
+        }
+        let network_id = c.u64()?;
+        let genesis_hash = c.arr::<32>()?;
+        let fingerprint = c.u64()?;
+        let checksum = c.u64()?;
+        Some(SnapshotId { tag: ChainTag { network_id, genesis_hash }, fingerprint, checksum })
+    }
+}
+
+const CLAIM_MAGIC: &[u8; 4] = b"MLXF";
+const CLAIM_VERSION: u32 = 1;
+/// magic(4) + version(4) + network_id(8) + genesis_hash(32) + fingerprint(8)
+/// + checksum(8) + finalized(8) + the sidecar's own checksum(8).
+const CLAIM_LEN: usize = 80;
+
+/// Where the finality claim for the index at `index` lives: the same name plus
+/// `.final`. Appended rather than swapped in as the extension, so it can never
+/// collide with the index's own scratch files (`next_tmp_path` replaces the
+/// extension).
+pub fn finality_claim_path(index: &Path) -> PathBuf {
+    let mut name = index.as_os_str().to_owned();
+    name.push(".final");
+    PathBuf::from(name)
+}
+
+/// Record that the index file at `index`, whose contents are `id`, holds no
+/// coverage above `finalized` and was written while this node's light client
+/// had verified finality at least that far. Atomic, like the index itself.
+/// Write it AFTER the index: a crash in between leaves the previous claim
+/// beside a file it does not describe, which [`read_finality_claim`] rejects.
+/// A zero `finalized` claims nothing and is refused (`InvalidInput`); remove
+/// the claim instead.
+pub fn write_finality_claim(index: &Path, id: &SnapshotId, finalized: u64) -> std::io::Result<()> {
+    if finalized == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a finality claim at block 0 claims nothing",
+        ));
+    }
+    let mut out = Vec::with_capacity(CLAIM_LEN);
+    out.extend_from_slice(CLAIM_MAGIC);
+    put_u32(&mut out, CLAIM_VERSION);
+    put_u64(&mut out, id.tag.network_id);
+    out.extend_from_slice(&id.tag.genesis_hash);
+    put_u64(&mut out, id.fingerprint);
+    put_u64(&mut out, id.checksum);
+    put_u64(&mut out, finalized);
+    let sum = fnv64(&out);
+    put_u64(&mut out, sum);
+    write_atomic(&finality_claim_path(index), &out)
+}
+
+/// The finality claimed for the index file whose contents are `id`, or `None`
+/// when there is no claim, it is damaged, or it describes a different file.
+/// Only an exact match means "this node wrote these bytes".
+pub fn read_finality_claim(index: &Path, id: &SnapshotId) -> Option<u64> {
+    let data = std::fs::read(finality_claim_path(index)).ok()?;
+    if data.len() != CLAIM_LEN {
+        return None;
+    }
+    let (body, stored_sum) = data.split_at(CLAIM_LEN - 8);
+    if stored_sum != fnv64(body).to_le_bytes() {
+        return None;
+    }
+    let mut c = Cursor { d: body, pos: 0 };
+    if c.take(4)? != CLAIM_MAGIC || c.u32()? != CLAIM_VERSION {
+        return None;
+    }
+    let network_id = c.u64()?;
+    let genesis_hash = c.arr::<32>()?;
+    let fingerprint = c.u64()?;
+    let checksum = c.u64()?;
+    let finalized = c.u64()?;
+    let claimed = SnapshotId { tag: ChainTag { network_id, genesis_hash }, fingerprint, checksum };
+    // Zero is never written (`write_finality_claim` refuses it), so reading
+    // one back means the file is not what this code wrote.
+    (claimed == *id && finalized > 0).then_some(finalized)
+}
+
+/// Remove the finality claim beside `index`, for a write that cannot vouch for
+/// what it puts on disk. Absent already is success.
+pub fn remove_finality_claim(index: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(finality_claim_path(index)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge: combine self-describing snapshots (import). The output is CANONICAL —
+// every present span shares one global high and the cursor sits at the global
+// low — because that is the only shape the appender/walker pair can resume:
+// `append_block` demands each new block adjoin EVERY live entry's span, so
+// per-entry frontiers at different heights would wedge the appender on its
+// first tick. Canonicalization is what turns "import then catch up" into the
+// machinery that already exists (walker descends to the new lows, bridge +
+// appender close the top) instead of new per-entry reconciliation code.
+// ---------------------------------------------------------------------------
+
+/// Why a set of snapshots cannot be merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeError {
+    /// No sources given.
+    Empty,
+    /// A source belongs to another network. Merging it would key logs of a
+    /// foreign chain into this chain's block numbers — fabricated coverage.
+    ChainMismatch { expected: ChainTag, got: ChainTag },
+    /// Two sources watch the same key under DIFFERENT restrictions (topic0
+    /// sets, or a topic entry's positions). A coverage span's meaning
+    /// includes the restriction it was indexed under; unioning restrictions
+    /// would claim logs nobody stored. Refused rather than resolved —
+    /// re-generate one source with matching topics.
+    TopicConflict(WatchKey),
+}
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MergeError::Empty => write!(f, "nothing to merge"),
+            MergeError::ChainMismatch { expected, got } => write!(
+                f,
+                "snapshot belongs to another chain (network id {}, expected {})",
+                got.network_id, expected.network_id
+            ),
+            MergeError::TopicConflict(k) => {
+                write!(f, "{k} is watched under conflicting topic restrictions")
+            }
+        }
+    }
+}
+
+impl LogIndex {
+    /// Merge portable snapshots (all of one chain) into a single canonical
+    /// index. Rules:
+    ///
+    /// - watch union — same key requires the same restriction
+    ///   ([`MergeError::TopicConflict`]); `from_block` = min (undershooting
+    ///   cannot lie); name = first non-empty in input order.
+    /// - sources that contribute nothing (no new key, no lower
+    ///   `from_block`, no coverage extension) are dropped FIRST, so a stale
+    ///   re-import cannot drag the global high back in time.
+    /// - coverage: global high `H` = min over contributing sources' own
+    ///   highs; every span is clamped to `H` (one whose low is above `H`
+    ///   vanishes — its blocks re-index later) and unioned per key. With
+    ///   canonical inputs every surviving span contains `H`, so the union is
+    ///   contiguous and single-span coverage suffices. The band above `H` is
+    ///   re-covered by the existing bridge/appender — re-fetched, never
+    ///   trusted from the staler file.
+    /// - logs: kept iff inside the merged span of an entry that selects them —
+    ///   anything else is unreachable by the coverage-honest query anyway.
+    /// - cursor: the lowest source cursor (the deepest verified trust edge).
+    ///
+    /// Non-canonical inputs (hand-crafted files) degrade safely: a span that
+    /// cannot share `H` goes dormant (None — re-indexed), a cursor above some
+    /// span's low is dropped (the appender re-seeds it).
+    ///
+    /// The output's `enabled`/`max_speed` are false: runtime bits the
+    /// installing host decides, never file content.
+    pub fn merge(sources: Vec<(ChainTag, LogIndex)>) -> Result<(ChainTag, LogIndex), MergeError> {
+        let Some(expected) = sources.first().map(|(t, _)| *t) else {
+            return Err(MergeError::Empty);
+        };
+        if let Some((got, _)) = sources.iter().find(|(t, _)| *t != expected) {
+            return Err(MergeError::ChainMismatch { expected, got: *got });
+        }
+        let mut sources: Vec<LogIndex> = sources.into_iter().map(|(_, ix)| ix).collect();
+        // Topic conflicts are structural — check before any pruning so a
+        // conflicting pair is refused even when one side would be pruned.
+        for (i, a) in sources.iter().enumerate() {
+            for b in sources.iter().skip(i + 1) {
+                for wa in &a.config.watch {
+                    if let Some(wb) = b.config.watch.iter().find(|w| w.key == wa.key) {
+                        if !wa.same_restriction(wb) {
+                            return Err(MergeError::TopicConflict(wa.key));
+                        }
+                    }
+                }
+            }
+        }
+        // Drop redundant sources: everything they declare and cover is
+        // already declared and covered (at least as deeply) by the rest.
+        loop {
+            let redundant = (0..sources.len()).find(|&i| {
+                sources.len() > 1 && {
+                    let rest: Vec<&LogIndex> = sources
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, s)| s)
+                        .collect();
+                    sources[i].config.watch.iter().all(|w| {
+                        rest.iter().any(|r| {
+                            r.config.watch.iter().zip(r.coverage.iter()).any(|(rw, rc)| {
+                                rw.key == w.key
+                                    && rw.from_block <= w.from_block
+                                    && match sources[i].coverage_of(&w.key).and_then(|c| c.span) {
+                                        None => true,
+                                        Some((low, high)) => matches!(
+                                            rc.span,
+                                            Some((rl, rh)) if rl <= low && high <= rh
+                                        ),
+                                    }
+                            })
+                        })
+                    })
+                }
+            });
+            match redundant {
+                Some(i) => {
+                    sources.remove(i);
+                }
+                None => break,
+            }
+        }
+        // Union the watch-lists (config order: first source first).
+        let mut watch: Vec<WatchEntry> = Vec::new();
+        for s in &sources {
+            for w in &s.config.watch {
+                match watch.iter_mut().find(|m| m.key == w.key) {
+                    Some(m) => {
+                        m.from_block = m.from_block.min(w.from_block);
+                        if m.name.is_empty() && !w.name.is_empty() {
+                            m.name = w.name.clone();
+                        }
+                    }
+                    None => watch.push(w.clone()),
+                }
+            }
+        }
+        // Global high H: the minimum of the contributing sources' own highs.
+        // A source without any coverage contributes config only and does not
+        // constrain H.
+        let h = sources
+            .iter()
+            .filter_map(|s| s.coverage.iter().filter_map(|c| c.span.map(|(_, hi)| hi)).max())
+            .min();
+        // Per entry: clamp every source span to H, union what overlaps or
+        // adjoins, and if disjoint pieces survive (non-canonical inputs only)
+        // keep the lowest — deployment-anchored history is the part a
+        // cold-syncing wallet cannot rebuild from the head.
+        let coverage: Vec<Coverage> = watch
+            .iter()
+            .map(|w| {
+                let mut pieces: Vec<(u64, u64)> = sources
+                    .iter()
+                    .filter_map(|s| s.coverage_of(&w.key).and_then(|c| c.span))
+                    .filter_map(|(low, high)| {
+                        let h = h.expect("a span exists, so H exists");
+                        (low <= h).then_some((low, high.min(h)))
+                    })
+                    .collect();
+                pieces.sort_unstable();
+                let merged = pieces.into_iter().fold(Vec::<(u64, u64)>::new(), |mut acc, p| {
+                    match acc.last_mut() {
+                        Some(last) if p.0 <= last.1.saturating_add(1) => last.1 = last.1.max(p.1),
+                        _ => acc.push(p),
+                    }
+                    acc
+                });
+                Coverage { span: merged.first().copied() }
+            })
+            .collect();
+        // Canonical output invariant: every present span ends at the same
+        // high. A piece that cannot (non-canonical input) goes dormant.
+        let out_high = coverage.iter().filter_map(|c| c.span.map(|(_, hi)| hi)).max();
+        let coverage: Vec<Coverage> = coverage
+            .into_iter()
+            .map(|c| Coverage { span: c.span.filter(|(_, hi)| Some(*hi) == out_high) })
+            .collect();
+        // Cursor: the DEEPEST source trust edge the walk can actually resume
+        // from (see [`walk_resumable`] — every incomplete span must sit at or
+        // below it; the walk re-descends THROUGH deeper spans, it can never
+        // reach a hole above itself). When no source cursor qualifies, no
+        // cursor at all: the appender re-seeds at the top and the walker
+        // re-descends through the merged spans — headers-only where the
+        // bloom misses, and every hole closes on the way down.
+        let mut candidates: Vec<(u64, [u8; 32])> = sources.iter().filter_map(|s| s.cursor).collect();
+        candidates.sort_unstable_by_key(|(n, _)| *n);
+        let cursor = candidates
+            .into_iter()
+            .find(|c| walk_resumable(&watch, &coverage, Some(*c)));
+        // Logs: only what the merged coverage can actually serve.
+        let mut logs = BTreeMap::new();
+        for s in &mut sources {
+            let taken = std::mem::take(&mut s.logs);
+            for (key, log) in taken {
+                let served = watch.iter().zip(coverage.iter()).any(|(w, c)| {
+                    w.selects(log.block_number, &log.address, &log.topics)
+                        && c.contains(log.block_number, log.block_number)
+                });
+                if served {
+                    logs.insert(key, log);
+                }
+            }
+        }
+        let config = LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch };
+        // Duplicates are impossible post-union; new() also re-validates.
+        let ix = Self::new(config).expect("union has unique keys");
+        Ok((expected, Self { coverage, logs, cursor, ..ix }))
+    }
+}
+
+/// Can the single-cursor walk, resuming from `cursor`, eventually complete
+/// every entry? The walker only DESCENDS: from `cursor - 1` down to the
+/// lowest `from_block`, extending each entry it passes. So a hole that sits
+/// ABOVE the cursor is unreachable forever, and `backfill_block`'s gap check
+/// wedges outright on an incomplete span whose low is above the walk. The
+/// resumable states are exactly:
+///
+/// - `cursor == None`: always resumable — the appender seeds the cursor at
+///   the top on its next append (extending every present span and every
+///   absent one together, so the all-highs-equal invariant holds) and the
+///   walker re-descends through everything; costly, never wrong.
+/// - `cursor == Some(n)`: every present span is either complete
+///   (`low <= from_block` — the walker skips it below its from_block) or
+///   reachable (`low <= n` — the walk passes through it on the way down),
+///   AND every ABSENT span belongs to an entry starting above the frontier
+///   (`from_block > H` — the appender's job); an absent span with
+///   `from_block <= H` has its whole range above the descending walk.
+///
+/// This is the invariant [`LogIndex::merge`] and [`LogIndex::adopt_config`]
+/// preserve; getting it backwards (cursor at/below every low) was a
+/// walk-wedging bug — the walker demands the OPPOSITE half.
+fn walk_resumable(
+    watch: &[WatchEntry],
+    coverage: &[Coverage],
+    cursor: Option<(u64, [u8; 32])>,
+) -> bool {
+    let Some((n, _)) = cursor else {
+        return true;
+    };
+    let Some(h) = coverage.iter().filter_map(|c| c.span.map(|(_, hi)| hi)).max() else {
+        return false; // a cursor with nothing covered: nothing seeded it
+    };
+    watch.iter().zip(coverage.iter()).all(|(w, c)| match c.span {
+        Some((low, _)) => low <= w.from_block || low <= n,
+        None => w.from_block > h,
+    })
+}
+
+/// A fully parsed v2 frame (tag + fingerprint + watch-table + body), before
+/// any policy decision about configs or tags.
+struct ParsedV2 {
+    tag: ChainTag,
+    fingerprint: u64,
+    /// The payload checksum, already verified against the payload.
+    checksum: u64,
+    watch: Vec<WatchEntry>,
+    coverage: Vec<Coverage>,
+    cursor: Option<(u64, [u8; 32])>,
+    logs: BTreeMap<(u64, u32), StoredLog>,
+}
+
+/// Parse a v2 or v3 frame (`version`) from just past the version field.
+/// Verifies the checksum and structural framing; policy checks (tag,
+/// fingerprint-vs-config, the watch-list's own validity) are the caller's.
+fn parse_v2(data: &[u8], mut c: Cursor, version: u32) -> Option<ParsedV2> {
+    let network_id = c.u64()?;
+    let genesis_hash = c.arr::<32>()?;
+    let fingerprint = c.u64()?;
+    let stored_sum = c.u64()?;
+    if fnv64(data.get(V2_CHECKSUM_AT + 8..)?) != stored_sum {
+        return None;
+    }
+    let n_watch = c.u32()? as usize;
+    let mut watch = Vec::with_capacity(n_watch.min(1024));
+    for _ in 0..n_watch {
+        let kind = if version == VERSION_TOPICS { *c.take(1)?.first()? } else { KIND_ADDRESS };
+        let (key, from_block, positions) = match kind {
+            KIND_ADDRESS => (WatchKey::Address(c.arr::<20>()?), c.u64()?, Vec::new()),
+            KIND_TOPIC => {
+                let value = c.arr::<32>()?;
+                let from_block = c.u64()?;
+                let positions = c.bytes()?;
+                if positions.len() > TOPIC_POSITIONS.len() {
+                    return None;
+                }
+                (WatchKey::Topic(value), from_block, positions.to_vec())
+            }
+            _ => return None,
+        };
+        let n_topics = c.u32()? as usize;
+        let mut topic0s = Vec::with_capacity(n_topics.min(64));
+        for _ in 0..n_topics {
+            topic0s.push(c.arr::<32>()?);
+        }
+        let name = String::from_utf8(c.bytes()?.to_vec()).ok()?;
+        watch.push(WatchEntry { key, from_block, topic0s, positions, name });
+    }
+    // Coverage is parallel to the watch-table by construction of the writer —
+    // a count disagreeing with the table is an inconsistent frame.
+    let n_cov = c.u32()? as usize;
+    if n_cov != n_watch {
+        return None;
+    }
+    let (coverage, cursor, logs) = parse_body(&mut c, n_cov)?;
+    if c.pos != data.len() {
+        return None; // trailing garbage → treat as corrupt
+    }
+    Some(ParsedV2 {
+        tag: ChainTag { network_id, genesis_hash },
+        fingerprint,
+        checksum: stored_sum,
+        watch,
+        coverage,
+        cursor,
+        logs,
+    })
+}
+
+/// Parse the coverage + cursor + log body shared by v1 and v2 frames.
+#[allow(clippy::type_complexity)]
+fn parse_body(
+    c: &mut Cursor,
+    n_cov: usize,
+) -> Option<(Vec<Coverage>, Option<(u64, [u8; 32])>, BTreeMap<(u64, u32), StoredLog>)> {
+    let mut coverage = Vec::with_capacity(n_cov.min(1024));
+    for _ in 0..n_cov {
+        coverage.push(match c.take(1)?.first().copied()? {
+            0 => Coverage::default(),
+            1 => Coverage { span: Some((c.u64()?, c.u64()?)) },
+            _ => return None,
+        });
+    }
+    let cursor = match c.take(1)?.first().copied()? {
+        0 => None,
+        1 => Some((c.u64()?, c.arr::<32>()?)),
+        _ => return None,
+    };
+    let n_logs = c.u64()?;
+    let mut logs = BTreeMap::new();
+    for _ in 0..n_logs {
+        let block_number = c.u64()?;
+        let block_hash = c.arr::<32>()?;
+        let tx_hash = c.arr::<32>()?;
+        let tx_index = c.u32()?;
+        let log_index = c.u32()?;
+        let address = c.arr::<20>()?;
+        let n_topics = c.u32()? as usize;
+        if n_topics > 4 {
+            return None;
+        }
+        let mut topics = Vec::with_capacity(n_topics);
+        for _ in 0..n_topics {
+            topics.push(c.arr::<32>()?);
+        }
+        let data = c.bytes()?.to_vec();
+        logs.insert(
+            (block_number, log_index),
+            StoredLog { block_number, block_hash, tx_hash, tx_index, log_index, address, topics, data },
+        );
+    }
+    Some((coverage, cursor, logs))
+}
+
+#[cfg(test)]
+mod tests {
+    /// `scripts/synth_logindex.py` re-implements `serialize_impl` byte for
+    /// byte so a full node's `eth_getLogs` output can seed the index without
+    /// a devp2p walk (an UNVERIFIED, debug-only seed — the script says so).
+    /// Pin that the frame it writes is accepted by the portable loader and
+    /// queryable with the honest refusal below the fetched span, so a layout
+    /// change on either side fails here rather than at import. Skips (loudly)
+    /// where `python3` is not runnable — the pin holds on the Linux CI lanes,
+    /// which always have it; the Windows smoke lane runs `cargo test
+    /// --workspace` too and must not go red for a missing interpreter.
+    #[test]
+    fn synth_logindex_script_frame_is_importable() {
+        let python_runs = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !python_runs {
+            eprintln!("skipping synth_logindex_script_frame_is_importable: python3 is not runnable here");
+            return;
+        }
+        // Removed on every exit path, including a failing assert.
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(std::env::temp_dir().join(format!("logindex-synth-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/synth_logindex.py");
+
+        // A synthetic contract at [0x45; 20], deployed at 31_305_656, fetched
+        // over 47_000_000..=47_000_010: two kept logs (blocks 47_000_005 and
+        // 47_000_009) and one `removed` entry the script must drop.
+        let address = [0x45u8; 20];
+        let line = |topics: &[u8], data: &str, block: &str, tx_index: &str, log_index: &str, removed: bool| {
+            let topics: Vec<String> = topics.iter().map(|b| format!("\"0x{}\"", format!("{b:02x}").repeat(32))).collect();
+            format!(
+                r#"{{"address":"0x{}","topics":[{}],"data":"{data}","blockNumber":"{block}","blockHash":"0x{}","transactionHash":"0x{}","transactionIndex":"{tx_index}","logIndex":"{log_index}","removed":{removed}}}"#,
+                "45".repeat(20),
+                topics.join(","),
+                "aa".repeat(32),
+                "bb".repeat(32),
+            )
+        };
+        let good = [
+            line(&[0x11, 0x22], "0xdeadbeef", "0x2cd29c5", "0x3", "0x7", false),
+            line(&[0x22], "0x", "0x2cd29c9", "0x0", "0x0", false),
+            line(&[0x11], "0x01", "0x2cd29c9", "0x0", "0x1", true),
+        ]
+        .join("\n");
+        let run = |name: &str, jsonl: &str| -> (bool, std::path::PathBuf) {
+            let input = dir.0.join(format!("{name}.jsonl"));
+            std::fs::write(&input, jsonl).unwrap();
+            let out = dir.0.join(format!("{name}.db"));
+            let status = std::process::Command::new("python3")
+                .arg(&script)
+                .args(["--network-id", "100"])
+                .args(["--watch", &format!("0x{}:31305656", "45".repeat(20))])
+                .args(["--from-block", "47000000", "--to-block", "47000010", "--finality-margin", "0"])
+                .arg("--logs")
+                .arg(&input)
+                .arg("--out")
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("python3 was runnable a moment ago");
+            (status.success(), out)
+        };
+
+        let (ok, out) = run("good", &good);
+        assert!(ok, "synth_logindex.py rejected a well-formed input");
+        let (tag, ix) = LogIndex::load_portable(&out).expect("the synthesized frame must load");
+        let gnosis = crate::el::reader::ElConfig::gnosis();
+        assert_eq!(tag.network_id, gnosis.network_id);
+        assert_eq!(tag.genesis_hash, gnosis.genesis_hash);
+        assert_eq!(ix.config.watch.len(), 1);
+        assert_eq!(ix.config.watch[0].key, address.into());
+        assert_eq!(ix.config.watch[0].from_block, 31_305_656, "the deployment block, not the fetch's low edge");
+        assert!(ix.config.watch[0].topic0s.is_empty());
+        assert_eq!(ix.coverage[0].span, Some((47_000_000, 47_000_010)), "coverage is the fetched range");
+        assert_eq!(ix.cursor, None);
+        assert_eq!(ix.log_count(), 2);
+
+        // Runtime bits are the host's: enable to query, then filter by topic0
+        // the way Bee does (an OR-list at position 0).
+        let mut ix = ix;
+        ix.config.enabled = true;
+        let all = ix
+            .query(&LogFilter { from_block: 47_000_000, to_block: 47_000_010, addresses: vec![address], topics: vec![] })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].block_number, 47_000_005);
+        assert_eq!(all[0].tx_index, 3);
+        assert_eq!(all[0].log_index, 7);
+        assert_eq!(all[0].data, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(all[0].topics.len(), 2);
+        let only_t1 = ix
+            .query(&LogFilter {
+                from_block: 47_000_000,
+                to_block: 47_000_010,
+                addresses: vec![address],
+                topics: vec![vec![[0x11; 32]]],
+            })
+            .unwrap();
+        assert_eq!(only_t1.len(), 1);
+        assert_eq!(only_t1[0].block_number, 47_000_005);
+        // Between the deployment block and the fetched span, and above the
+        // span's high: out of coverage — the honest refusal, never `[]`.
+        for (from, to) in [(31_305_656, 46_999_999), (46_999_990, 47_000_010), (47_000_000, 47_000_011)] {
+            assert!(
+                matches!(
+                    ix.query(&LogFilter { from_block: from, to_block: to, addresses: vec![address], topics: vec![] }),
+                    Err(QueryError::OutOfCoverage { .. })
+                ),
+                "{from}..{to} must be refused, not answered"
+            );
+        }
+
+        // A log outside the declared fetch range contradicts the coverage the
+        // frame would assert: the script must refuse, not drop it.
+        let outside = [good.as_str(), &line(&[0x11], "0x", "0x2cd29cb", "0x0", "0x0", false)].join("\n");
+        let (ok, _) = run("outside", &outside);
+        assert!(!ok, "a log above --to-block must be a hard error");
+    }
+
+    #[test]
+    fn pausing_the_backfill_is_fingerprint_neutral_and_flippable() {
+        // The pause is a runtime bit like max_speed: coverage already walked
+        // must survive the flip, and resuming continues from the same cursor.
+        let w = WatchEntry { key: WatchKey::Address([9u8; 20]), positions: vec![], from_block: 5, topic0s: vec![], name: String::new() };
+        let running = LogIndexConfig {
+            enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()],
+        };
+        let paused = LogIndexConfig {
+            enabled: true, max_speed: false, backfill_paused: true, watch: vec![w],
+        };
+        assert_eq!(running.fingerprint(), paused.fingerprint());
+        let mut ix = LogIndex::new(running).unwrap();
+        assert!(!ix.config().backfill_paused);
+        ix.set_backfill_paused(true);
+        assert!(ix.config().backfill_paused);
+        ix.set_backfill_paused(false);
+        assert!(!ix.config().backfill_paused);
+    }
+
+    #[test]
+    fn max_speed_is_fingerprint_neutral_and_flippable() {
+        let w = WatchEntry { key: WatchKey::Address([7u8; 20]), positions: vec![], from_block: 5, topic0s: vec![], name: String::new() };
+        let a = LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()] };
+        let b = LogIndexConfig { enabled: true, max_speed: true, backfill_paused: false, watch: vec![w] };
+        // Flipping pacing must never invalidate accumulated coverage.
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        let mut ix = LogIndex::new(a).unwrap();
+        assert!(!ix.config().max_speed);
+        ix.set_max_speed(true);
+        assert!(ix.config().max_speed);
+    }
+
+    use super::*;
+
+    fn addr(b: u8) -> [u8; 20] {
+        [b; 20]
+    }
+
+    fn topic(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    fn log(bn: u64, li: u32, a: [u8; 20], topics: Vec<[u8; 32]>) -> StoredLog {
+        StoredLog {
+            block_number: bn,
+            block_hash: [0xbb; 32],
+            tx_hash: [0xcc; 32],
+            tx_index: 0,
+            log_index: li,
+            address: a,
+            topics,
+            data: vec![1, 2, 3],
+        }
+    }
+
+    fn watch_all(a: [u8; 20], from: u64) -> WatchEntry {
+        WatchEntry { key: WatchKey::Address(a), positions: vec![], from_block: from, topic0s: vec![], name: String::new() }
+    }
+
+    /// The chain tag every test persists under (arbitrary but fixed).
+    fn tag() -> ChainTag {
+        ChainTag { network_id: 1, genesis_hash: [0xd4; 32] }
+    }
+
+    fn config(entries: Vec<WatchEntry>) -> LogIndexConfig {
+        LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: entries }
+    }
+
+    /// `LogIndex::new(config(...)).unwrap()` shorthand for valid configs.
+    fn config_ok(entries: Vec<WatchEntry>) -> LogIndexConfig {
+        config(entries)
+    }
+
+    fn filter(from: u64, to: u64, a: [u8; 20]) -> LogFilter {
+        LogFilter { from_block: from, to_block: to, addresses: vec![a], topics: vec![] }
+    }
+
+    #[test]
+    fn query_outside_coverage_errors_never_empty() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![]).unwrap();
+        ix.append_block(201, [0xbb; 32], vec![log(201, 0, addr(1), vec![topic(9)])]).unwrap();
+        // Covered range answers (including the empty block).
+        assert_eq!(ix.query(&filter(200, 200, addr(1))).unwrap(), vec![]);
+        assert_eq!(ix.query(&filter(200, 201, addr(1))).unwrap().len(), 1);
+        // Range dipping below coverage errors instead of answering empt-ish.
+        match ix.query(&filter(150, 201, addr(1))) {
+            Err(QueryError::OutOfCoverage { key, covered }) => {
+                assert_eq!(key, addr(1).into());
+                assert_eq!(covered.span, Some((200, 201)));
+            }
+            other => panic!("expected OutOfCoverage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_below_from_block_needs_no_coverage() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 500)])).unwrap();
+        ix.append_block(500, [0xbb; 32], vec![]).unwrap();
+        // 100..=500 is fine: below from_block the contract can't have logs.
+        assert_eq!(ix.query(&filter(100, 500, addr(1))).unwrap(), vec![]);
+        // Entirely below from_block: nothing to cover, empty is honest.
+        assert_eq!(ix.query(&filter(100, 400, addr(1))).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn unwatched_address_and_disabled_error() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix.append_block(10, [0xbb; 32], vec![]).unwrap();
+        assert_eq!(ix.query(&filter(0, 10, addr(2))), Err(QueryError::UnwatchedAddress(addr(2))));
+        let off = LogIndex::new(LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
+        assert_eq!(off.query(&filter(0, 0, addr(1))), Err(QueryError::Disabled));
+        // No address, and no topic entry for anything the filter pins.
+        assert_eq!(ix.query(&LogFilter { from_block: 0, to_block: 10, addresses: vec![], topics: vec![] }), Err(QueryError::UnwatchedTopic));
+        assert_eq!(ix.query(&LogFilter { from_block: 10, to_block: 0, addresses: vec![addr(1)], topics: vec![] }), Err(QueryError::Unanswerable));
+    }
+
+    #[test]
+    fn topic_restricted_watch_rejects_wildcard_queries() {
+        let w = WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 0, topic0s: vec![topic(7)], name: String::new() };
+        let mut ix = LogIndex::new(config_ok(vec![w])).unwrap();
+        ix.append_block(5, [0xbb; 32], vec![log(5, 0, addr(1), vec![topic(7)])]).unwrap();
+        // Wildcard topic0 would deserve unindexed signatures → error.
+        assert_eq!(ix.query(&filter(5, 5, addr(1))), Err(QueryError::UnindexedTopic(addr(1).into())));
+        // Pinned to the indexed signature → answers.
+        let mut f = filter(5, 5, addr(1));
+        f.topics = vec![vec![topic(7)]];
+        assert_eq!(ix.query(&f).unwrap().len(), 1);
+        // Pinned to a different signature → error, not empty.
+        f.topics = vec![vec![topic(8)]];
+        assert_eq!(ix.query(&f), Err(QueryError::UnindexedTopic(addr(1).into())));
+    }
+
+    #[test]
+    fn positional_topic_matching() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix.append_block(1, [0xbb; 32], vec![log(1, 0, addr(1), vec![topic(7), topic(8)])]).unwrap();
+        let mut f = filter(1, 1, addr(1));
+        f.topics = vec![vec![], vec![topic(8), topic(9)]]; // wildcard t0, OR at t1
+        assert_eq!(ix.query(&f).unwrap().len(), 1);
+        f.topics = vec![vec![], vec![topic(9)]];
+        assert_eq!(ix.query(&f).unwrap().len(), 0); // covered range, honest empty
+        f.topics = vec![vec![], vec![], vec![topic(1)]]; // position beyond log's topics
+        assert_eq!(ix.query(&f).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn backfill_extends_down_and_tracks_cursor() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
+        ix.append_block(300, [0xbb; 32], vec![]).unwrap();
+        ix.backfill_block(299, [9; 32], vec![log(299, 2, addr(1), vec![])]).unwrap();
+        ix.backfill_block(298, [8; 32], vec![]).unwrap();
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((298, 300)));
+        assert_eq!(ix.cursor, Some((298, [8; 32])));
+        assert_eq!(ix.query(&filter(298, 300, addr(1))).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clamped_persist_leaves_optimistic_coverage_out_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("logindex-clamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clamped.db");
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10..=14 {
+            ix.append_block(b, [b as u8; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
+        }
+        // Finality at 12: blocks 13-14 are optimistic and must not persist —
+        // a later run has no way to re-check them, and once finality moves
+        // past them nothing would ever rewind them.
+        ix.persist_clamped(&tag(), &path, 12).unwrap();
+        let loaded = LogIndex::load(&cfg, &tag(), &path).unwrap();
+        assert_eq!(loaded.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.log_count(), 3);
+        // The live index is untouched — the clamp is a serialization concern.
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.log_count(), 5);
+        // Nothing above the clamp → byte-identical to a plain serialize.
+        assert_eq!(ix.serialize_clamped(&tag(), 14), ix.serialize(&tag()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_writes_to_one_path_never_share_a_scratch_file() {
+        // THE invariant that keeps two concurrent checkpoints apart, asserted
+        // directly rather than raced for: `concurrent_writers_never_leave_a_
+        // spliced_file` below exercises the same property, but only detects a
+        // violation when the threads happen to interleave inside the write
+        // window, so it cannot be the only guard. Here a regression to a
+        // per-process name fails every run, on any scheduler.
+        let path = std::path::Path::new("/tmp/whatever/index.db");
+        let names: std::collections::HashSet<_> = (0..64).map(|_| next_tmp_path(path)).collect();
+        assert_eq!(names.len(), 64, "two calls chose the same temp path");
+        // Still per-process, still beside the target, still not the target.
+        for n in &names {
+            assert_eq!(
+                n.parent(),
+                path.parent(),
+                "temp must be renameable onto path"
+            );
+            assert_ne!(n, path, "temp must not BE the target");
+            assert!(
+                n.to_string_lossy()
+                    .contains(&format!(".tmp.{}.", std::process::id())),
+                "temp must stay identifiable as this process's: {n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_never_leave_a_spliced_file() {
+        // The checkpoint write no longer happens under the index lock, so the
+        // temp path is what keeps two writers apart. With a per-PROCESS temp
+        // name they share one file: the second `File::create` truncates the
+        // first mid-write and the reader gets a splice of both — which, on a
+        // real index, means a checksum failure and a full re-walk of months of
+        // backfill. Distinct payload bytes make a splice detectable.
+        let dir = std::env::temp_dir().join(format!("logindex-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("racing.db");
+        const LEN: usize = 1 << 20; // big enough that the writes genuinely overlap
+        const WRITERS: u8 = 8;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A reader running throughout: `path` must NEVER be observable in a
+        // partial state. That is what the rename buys, and it is the property
+        // a caller relies on when it reloads a checkpoint after a crash.
+        let watcher = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut torn = None;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(got) = std::fs::read(&path) {
+                        if got.len() != LEN || got.iter().any(|b| *b != got[0]) {
+                            torn = Some(got.len());
+                            break;
+                        }
+                    }
+                }
+                torn
+            })
+        };
+        let writers: Vec<std::thread::JoinHandle<()>> = (1..=WRITERS)
+            .map(|k| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..3 {
+                        write_atomic(&path, &vec![k; LEN]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            watcher.join().unwrap(),
+            None,
+            "a reader saw a partial file: the swap is not atomic"
+        );
+        // Whatever landed must be exactly ONE writer's payload, whole.
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), LEN, "file is not one writer's payload");
+        let first = got[0];
+        assert!(
+            (1..=WRITERS).contains(&first),
+            "byte from no writer: {first}"
+        );
+        assert!(got.iter().all(|b| *b == first), "spliced payloads");
+        // And no temp files are left behind on the success path.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "leaked temp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clamping_writes_a_prefix_without_touching_the_live_index() {
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10..=14 {
+            ix.append_block(b, [b as u8; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
+        }
+        // A span entirely above the clamp disappears; one that straddles it is
+        // written with the clamped high; the live index is untouched either way.
+        let bytes = ix.serialize_clamped(&tag(), 12);
+        let loaded = LogIndex::deserialize(&cfg, &tag(), &bytes).unwrap();
+        assert_eq!(loaded.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.log_count(), 3);
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.log_count(), 5);
+        let below = LogIndex::deserialize(&cfg, &tag(), &ix.serialize_clamped(&tag(), 9)).unwrap();
+        assert_eq!(below.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, None);
+        assert_eq!(below.log_count(), 0);
+    }
+
+    #[test]
+    fn clamping_drops_a_cursor_above_the_clamp() {
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        // append_block seeds the cursor at the first appended block.
+        ix.append_block(20, [20; 32], vec![]).unwrap();
+        assert_eq!(ix.cursor, Some((20, [20; 32])));
+        // Clamped below it, the cursor must NOT persist: it is a hash, and
+        // above the clamp it may name a block that was never re-checked — a
+        // reloading walker would parent-chain into it.
+        let below = LogIndex::deserialize(&cfg, &tag(), &ix.serialize_clamped(&tag(), 15)).unwrap();
+        assert_eq!(below.cursor, None);
+        // At or above the cursor, it survives.
+        let at = LogIndex::deserialize(&cfg, &tag(), &ix.serialize_clamped(&tag(), 20)).unwrap();
+        assert_eq!(at.cursor, Some((20, [20; 32])));
+    }
+
+    #[test]
+    fn rewind_above_drops_logs_and_pulls_coverage_back() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        for b in 10..=14 {
+            ix.append_block(b, [0xbb; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
+        }
+        ix.rewind_above(12);
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 12)));
+        assert_eq!(ix.log_count(), 3);
+        // Above the fork point is out of coverage again.
+        assert!(matches!(ix.query(&filter(10, 14, addr(1))), Err(QueryError::OutOfCoverage { .. })));
+    }
+
+    #[test]
+    fn unwatched_logs_are_not_stored() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
+        // Wrong address, and right address but below from_block: both dropped.
+        ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(2), vec![])]).unwrap();
+        ix.backfill_block(99, [1; 32], vec![log(99, 0, addr(1), vec![])]).unwrap();
+        assert_eq!(ix.log_count(), 0);
+    }
+
+    #[test]
+    fn persist_load_roundtrip_and_invalidation() {
+        let dir = std::env::temp_dir().join(format!("logindex-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logindex-test.db");
+        let cfg = config(vec![watch_all(addr(1), 100), WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 0, topic0s: vec![topic(7)], name: String::new() }]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![log(200, 3, addr(1), vec![topic(7), topic(8)])]).unwrap();
+        ix.backfill_block(199, [7; 32], vec![]).unwrap();
+        ix.persist(&tag(), &path).unwrap();
+
+        let back = LogIndex::load(&cfg, &tag(), &path).expect("roundtrip");
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 200)));
+        assert_eq!(back.cursor, Some((199, [7; 32])));
+        assert_eq!(back.query(&filter(199, 200, addr(1))).unwrap(), ix.query(&filter(199, 200, addr(1))).unwrap());
+
+        // Changed watch-list → fingerprint mismatch → None (re-index).
+        let changed = config(vec![watch_all(addr(1), 101)]);
+        assert!(LogIndex::load(&changed, &tag(), &path).is_none());
+        // Another network's tag → None, even for the very config that wrote
+        // the file: the bytes carry their own chain identity.
+        let other = ChainTag { network_id: 11_155_111, genesis_hash: [0x25; 32] };
+        assert!(LogIndex::load(&cfg, &other, &path).is_none());
+        // Truncated file → None.
+        let data = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &data[..data.len() - 1]).unwrap();
+        assert!(LogIndex::load(&cfg, &tag(), &path).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gaps_are_rejected_not_bridged() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![]).unwrap();
+        // Skipping 201 must fail and store nothing.
+        assert_eq!(ix.append_block(205, [0xbb; 32], vec![log(205, 0, addr(1), vec![])]), Err(CoverageGap { edge: 200, block: 205 }));
+        assert_eq!(ix.log_count(), 0);
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
+        // Contiguous append still works; downward gap equally rejected.
+        ix.append_block(201, [0xbb; 32], vec![]).unwrap();
+        assert_eq!(ix.backfill_block(150, [1; 32], vec![]), Err(CoverageGap { edge: 200, block: 150 }));
+        ix.backfill_block(199, [2; 32], vec![]).unwrap();
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 201)));
+        // The gap blocks never answer as empty.
+        assert!(matches!(ix.query(&filter(199, 205, addr(1))), Err(QueryError::OutOfCoverage { .. })));
+    }
+
+    #[test]
+    fn deserialize_survives_arbitrary_corruption() {
+        let cfg = config(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        ix.append_block(7, [0xbb; 32], vec![log(7, 0, addr(1), vec![topic(1), topic(2)])]).unwrap();
+        let good = ix.serialize(&tag());
+        assert!(LogIndex::deserialize(&cfg, &tag(), &good).is_some());
+        // Every single-byte mutation must yield Some-or-None, never panic,
+        // and structural fields must not produce a bogus accepted index —
+        // on the config-keyed AND the self-describing path.
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0xff;
+            let _ = LogIndex::deserialize(&cfg, &tag(), &bad);
+            let _ = LogIndex::deserialize_portable(&bad);
+        }
+        // Every truncation length likewise.
+        for n in 0..good.len() {
+            assert!(LogIndex::deserialize(&cfg, &tag(), &good[..n]).is_none());
+            assert!(LogIndex::deserialize_portable(&good[..n]).is_none());
+        }
+        // Huge length prefixes must fail cleanly (no allocation bomb).
+        let mut huge = good.clone();
+        let tail = huge.len() - 4;
+        huge[tail..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let _ = LogIndex::deserialize(&cfg, &tag(), &huge);
+        let _ = LogIndex::deserialize_portable(&huge);
+    }
+
+    #[test]
+    fn duplicate_watch_addresses_are_rejected() {
+        let dup = config(vec![watch_all(addr(1), 0), WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 50, topic0s: vec![], name: String::new() }]);
+        // Askable ahead of construction, so a caller holding an index it must
+        // not lose can refuse the config before spending anything on it.
+        assert!(matches!(dup.invalid(), Some(InvalidWatchList::Duplicate(a)) if a == addr(1).into()));
+        assert!(matches!(LogIndex::new(dup), Err(InvalidWatchList::Duplicate(a)) if a == addr(1).into()));
+        // …and it answers None for the configs `new` accepts, including empty.
+        assert!(config(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)]).invalid().is_none());
+        assert!(config(vec![]).invalid().is_none());
+    }
+
+    /// Re-key serialized bytes to `fp` so a hand-written config the real
+    /// serializer could never have produced still gets past the fingerprint
+    /// gate. Sound without re-checksumming: the checksum covers only what
+    /// follows it, and the fingerprint sits directly ahead of it in both
+    /// layouts.
+    fn repoint_fingerprint(bytes: &mut [u8], checksum_at: usize, fp: u64) {
+        bytes[checksum_at - 8..checksum_at].copy_from_slice(&fp.to_le_bytes());
+    }
+
+    #[test]
+    fn deserializing_a_v2_file_under_a_duplicate_address_config_is_refused() {
+        // `deserialize` builds `Self` directly, bypassing `new`, so it has to
+        // re-apply the bar itself. Reachable in the field because a file is
+        // keyed by the fingerprint of the config it is read WITH: a
+        // hand-written duplicate config carries its own key, not the writer's.
+        let mut ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)])).unwrap();
+        ix.append_block(10, [0xbb; 32], vec![log(10, 0, addr(1), vec![topic(7)])]).unwrap();
+        let good = ix.serialize(&tag());
+
+        let dup = config(vec![watch_all(addr(1), 0), watch_all(addr(1), 0)]);
+        let mut keyed = good.clone();
+        repoint_fingerprint(&mut keyed, V2_CHECKSUM_AT, dup.fingerprint());
+        assert!(LogIndex::deserialize(&dup, &tag(), &keyed).is_none());
+
+        // Control: the same re-keying with a DISTINCT but duplicate-free
+        // config over the same addresses loads — so the refusal above is the
+        // duplicate check, not the fingerprint gate or the coverage re-pair.
+        let clean = config(vec![watch_all(addr(2), 5), watch_all(addr(1), 7)]);
+        let mut keyed = good;
+        repoint_fingerprint(&mut keyed, V2_CHECKSUM_AT, clean.fingerprint());
+        assert!(LogIndex::deserialize(&clean, &tag(), &keyed).is_some());
+    }
+
+    #[test]
+    fn deserializing_a_legacy_v1_file_under_a_duplicate_address_config_is_refused() {
+        // Same invariant on the upgrade path, which builds `Self` directly too.
+        let ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)])).unwrap();
+        let good = serialize_v1(&ix);
+
+        let dup = config(vec![watch_all(addr(1), 0), watch_all(addr(1), 0)]);
+        let mut keyed = good.clone();
+        repoint_fingerprint(&mut keyed, V1_CHECKSUM_AT, dup.fingerprint());
+        assert!(LogIndex::deserialize(&dup, &tag(), &keyed).is_none());
+
+        let clean = config(vec![watch_all(addr(2), 5), watch_all(addr(1), 7)]);
+        let mut keyed = good;
+        repoint_fingerprint(&mut keyed, V1_CHECKSUM_AT, clean.fingerprint());
+        assert!(LogIndex::deserialize(&clean, &tag(), &keyed).is_some());
+    }
+
+    /// `ElReader::set_log_index_config` screens the PUSHED config for
+    /// duplicates and then builds an index from `union_with`'s output, on a
+    /// path where a failure would have to discard an index it has already
+    /// consumed. That is only sound while the union cannot manufacture a
+    /// duplicate the screen never saw — pinned here, including for a `stored`
+    /// list that is itself duplicated (the union folds the second copy into
+    /// the entry the first one appended, rather than appending it again).
+    #[test]
+    fn a_union_never_manufactures_a_duplicate_the_pushed_config_lacked() {
+        let pushed = config(vec![watch_all(addr(1), 10), watch_all(addr(2), 10)]);
+        assert!(pushed.invalid().is_none());
+        for stored in [
+            vec![watch_all(addr(2), 5), watch_all(addr(3), 5)], // overlap + new
+            vec![watch_all(addr(3), 5), watch_all(addr(3), 7)], // duplicated stored
+            vec![watch_all(addr(1), 5), watch_all(addr(1), 7)], // duplicated overlap
+            vec![],
+        ] {
+            let union = pushed.union_with(&stored).expect("no topic conflict");
+            assert!(
+                union.invalid().is_none(),
+                "union_with produced a duplicate the guard could not have caught: {:?}",
+                union.watch.iter().map(|w| w.key.address().unwrap()[0]).collect::<Vec<_>>()
+            );
+            assert!(LogIndex::new(union).is_ok(), "the union config is unbuildable");
+        }
+    }
+
+    #[test]
+    fn rewind_below_backfill_edge_drops_cursor() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![]).unwrap();
+        ix.backfill_block(199, [9; 32], vec![]).unwrap();
+        // Fork below the walk's edge: the cursor hash may be orphaned.
+        ix.rewind_above(150);
+        assert_eq!(ix.cursor, None);
+        // Fork above the edge leaves the cursor intact.
+        let mut ix2 = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix2.append_block(200, [0xbb; 32], vec![]).unwrap();
+        ix2.backfill_block(199, [9; 32], vec![]).unwrap();
+        ix2.rewind_above(199);
+        assert_eq!(ix2.cursor, Some((199, [9; 32])));
+    }
+
+    #[test]
+    fn append_below_low_and_backfill_above_high_are_rejected() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![]).unwrap();
+        ix.backfill_block(199, [1; 32], vec![]).unwrap();
+        assert!(ix.append_block(150, [0xbb; 32], vec![log(150, 0, addr(1), vec![])]).is_err());
+        assert_eq!(ix.log_count(), 0); // nothing stored outside coverage
+        assert!(ix.backfill_block(300, [2; 32], vec![]).is_err());
+        // Re-processing inside the span stays allowed on both paths.
+        ix.append_block(200, [0xbb; 32], vec![]).unwrap();
+        ix.backfill_block(199, [1; 32], vec![]).unwrap();
+    }
+
+    #[test]
+    fn payload_bitflip_is_detected() {
+        let cfg = config(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        ix.append_block(7, [0xbb; 32], vec![log(7, 0, addr(1), vec![topic(1)])]).unwrap();
+        let good = ix.serialize(&tag());
+        // Flip one bit inside every payload byte (past the checksum field):
+        // the checksum must reject each one.
+        for i in V2_CHECKSUM_AT + 8..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            assert!(LogIndex::deserialize(&cfg, &tag(), &bad).is_none(), "bitflip at {i} accepted");
+            assert!(LogIndex::deserialize_portable(&bad).is_none(), "portable bitflip at {i} accepted");
+        }
+    }
+
+    #[test]
+    fn first_append_seeds_the_backfill_cursor() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        assert_eq!(ix.cursor, None);
+        ix.append_block(500, [5; 32], vec![]).unwrap();
+        assert_eq!(ix.cursor, Some((500, [5; 32])));
+        // Later appends leave the walk edge alone; backfill moves it down.
+        ix.append_block(501, [6; 32], vec![]).unwrap();
+        assert_eq!(ix.cursor, Some((500, [5; 32])));
+        ix.backfill_block(499, [4; 32], vec![]).unwrap();
+        assert_eq!(ix.cursor, Some((499, [4; 32])));
+    }
+
+    #[test]
+    fn fingerprint_is_order_insensitive_but_content_sensitive() {
+        let a = watch_all(addr(1), 5);
+        let b = WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 9, topic0s: vec![topic(3), topic(4)], name: String::new() };
+        let mut b_rev = b.clone();
+        b_rev.topic0s.reverse();
+        let c1 = config(vec![a.clone(), b.clone()]);
+        let c2 = config(vec![b_rev, a.clone()]);
+        assert_eq!(c1.fingerprint(), c2.fingerprint());
+        let c3 = config(vec![a, WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 10, topic0s: vec![topic(3), topic(4)], name: String::new() }]);
+        assert_ne!(c1.fingerprint(), c3.fingerprint());
+    }
+
+    #[test]
+    fn names_are_fingerprint_neutral_and_never_cost_a_reindex() {
+        let unnamed = config(vec![watch_all(addr(1), 100)]);
+        let mut named_entry = watch_all(addr(1), 100);
+        named_entry.name = "tornado.registry.eth".to_string();
+        let named = config(vec![named_entry]);
+        assert_eq!(unnamed.fingerprint(), named.fingerprint());
+        // A file written unnamed loads under a renamed config (and the
+        // config's name wins — the host is authoritative for cosmetics).
+        let mut ix = LogIndex::new(unnamed).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![]).unwrap();
+        let back = LogIndex::deserialize(&named, &tag(), &ix.serialize(&tag())).unwrap();
+        assert_eq!(back.config().watch[0].name, "tornado.registry.eth");
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
+    }
+
+    #[test]
+    fn portable_roundtrip_reconstructs_config_from_the_bytes() {
+        let mut w1 = watch_all(addr(1), 100);
+        w1.name = "tornado.registry.eth".to_string();
+        let w2 = WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 50, topic0s: vec![topic(7)], name: String::new() };
+        let mut ix = LogIndex::new(config(vec![w1.clone(), w2.clone()])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(1), vec![topic(7)])]).unwrap();
+        ix.backfill_block(199, [9; 32], vec![]).unwrap();
+
+        let (got_tag, back) = LogIndex::deserialize_portable(&ix.serialize(&tag())).expect("portable");
+        assert_eq!(got_tag, tag());
+        // The watch-list — names included — comes from the FILE, no config
+        // supplied. Runtime bits are the receiving host's decision.
+        assert_eq!(back.config().watch, vec![w1, w2]);
+        assert!(!back.config().enabled);
+        assert!(!back.config().max_speed);
+        // Coverage, cursor, and logs all survive.
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 200)));
+        assert_eq!(back.cursor, Some((199, [9; 32])));
+        assert_eq!(back.log_count(), 1);
+    }
+
+    #[test]
+    fn export_unnamed_strips_names_and_keeps_everything_else() {
+        let dir = std::env::temp_dir().join(format!("logindex-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export.db");
+        let mut named = watch_all(addr(1), 100);
+        named.name = "generator-resolved.eth".to_string();
+        let mut ix = LogIndex::new(config(vec![named])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(1), vec![])]).unwrap();
+        ix.export_unnamed(&tag(), &path, None).unwrap();
+        let (t, back) = LogIndex::load_portable(&path).expect("portable");
+        assert_eq!(t, tag());
+        // The name did NOT travel — the importing wallet resolves its own —
+        // but coverage, logs and from_block all did.
+        assert!(back.config().watch[0].name.is_empty());
+        assert_eq!(back.config().watch[0].from_block, 100);
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
+        assert_eq!(back.log_count(), 1);
+        // The clamp behaves like every checkpoint's.
+        ix.append_block(201, [0xbc; 32], vec![]).unwrap();
+        ix.export_unnamed(&tag(), &path, Some(200)).unwrap();
+        let (_, clamped) = LogIndex::load_portable(&path).unwrap();
+        assert_eq!(clamped.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_legacy_snapshot_detects_only_v1_frames() {
+        let dir = std::env::temp_dir().join(format!("logindex-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = config(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg).unwrap();
+        ix.append_block(5, [5; 32], vec![]).unwrap();
+        let v1 = dir.join("v1.db");
+        std::fs::write(&v1, serialize_v1(&ix)).unwrap();
+        assert!(LogIndex::is_legacy_snapshot(&v1));
+        let v2 = dir.join("v2.db");
+        ix.persist(&tag(), &v2).unwrap();
+        assert!(!LogIndex::is_legacy_snapshot(&v2));
+        let junk = dir.join("junk.db");
+        std::fs::write(&junk, b"nonsense").unwrap();
+        assert!(!LogIndex::is_legacy_snapshot(&junk));
+        assert!(!LogIndex::is_legacy_snapshot(&dir.join("absent.db")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v1_files_are_not_portable() {
+        let ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        let mut v1 = ix.serialize(&tag());
+        v1[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // (Bogus v1 framing after the version field — the point is only that
+        // the version gate itself refuses before parsing anything.)
+        assert!(LogIndex::deserialize_portable(&v1).is_none());
+    }
+
+    /// Serialize `ix` in the LEGACY v1 layout (what pre-v2 builds wrote):
+    /// magic, version 1, fingerprint, checksum over the rest, coverage,
+    /// cursor, logs — no chain tag, no watch-table.
+    fn serialize_v1(ix: &LogIndex) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        put_u32(&mut out, VERSION_LEGACY);
+        put_u64(&mut out, ix.config().fingerprint());
+        put_u64(&mut out, 0); // checksum placeholder
+        put_u32(&mut out, ix.coverage.len() as u32);
+        for c in &ix.coverage {
+            match c.span {
+                None => out.push(0),
+                Some((low, high)) => {
+                    out.push(1);
+                    put_u64(&mut out, low);
+                    put_u64(&mut out, high);
+                }
+            }
+        }
+        match ix.cursor {
+            None => out.push(0),
+            Some((n, h)) => {
+                out.push(1);
+                put_u64(&mut out, n);
+                out.extend_from_slice(&h);
+            }
+        }
+        put_u64(&mut out, ix.logs.len() as u64);
+        for log in ix.logs.values() {
+            put_u64(&mut out, log.block_number);
+            out.extend_from_slice(&log.block_hash);
+            out.extend_from_slice(&log.tx_hash);
+            put_u32(&mut out, log.tx_index);
+            put_u32(&mut out, log.log_index);
+            out.extend_from_slice(&log.address);
+            put_u32(&mut out, log.topics.len() as u32);
+            for t in &log.topics {
+                out.extend_from_slice(t);
+            }
+            put_bytes(&mut out, &log.data);
+        }
+        let sum = fnv64(&out[V1_CHECKSUM_AT + 8..]);
+        out[V1_CHECKSUM_AT..V1_CHECKSUM_AT + 8].copy_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn legacy_v1_files_still_load_preserving_coverage() {
+        // The upgrade path: a file written by a pre-v2 build must load (months
+        // of phone backfill must not re-index just because the code updated).
+        let cfg = config(vec![watch_all(addr(1), 100)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(1), vec![topic(7)])]).unwrap();
+        ix.backfill_block(199, [9; 32], vec![]).unwrap();
+        let v1 = serialize_v1(&ix);
+        let back = LogIndex::deserialize(&cfg, &tag(), &v1).expect("v1 upgrade load");
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 200)));
+        assert_eq!(back.cursor, Some((199, [9; 32])));
+        assert_eq!(back.log_count(), 1);
+        // Same guards as ever: wrong fingerprint or truncation → None.
+        assert!(LogIndex::deserialize(&config(vec![watch_all(addr(1), 101)]), &tag(), &v1).is_none());
+        assert!(LogIndex::deserialize(&cfg, &tag(), &v1[..v1.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn set_name_fills_only_unnamed_entries() {
+        let mut named = watch_all(addr(1), 0);
+        named.name = "baked.eth".to_string();
+        let mut ix = LogIndex::new(config(vec![named, watch_all(addr(2), 0)])).unwrap();
+        // A baked-in name outranks a late lookup; empty names never install.
+        assert!(!ix.set_name(&addr(1).into(), "late.eth"));
+        assert_eq!(ix.config().watch[0].name, "baked.eth");
+        assert!(!ix.set_name(&addr(2).into(), ""));
+        assert!(ix.set_name(&addr(2).into(), "resolved.eth"));
+        assert_eq!(ix.config().watch[1].name, "resolved.eth");
+        // Unknown address: no-op.
+        assert!(!ix.set_name(&addr(9).into(), "nobody.eth"));
+    }
+
+    #[test]
+    fn union_with_extends_stored_and_keeps_pushed_bits() {
+        // The additive re-apply: a preset push must extend an imported
+        // subscription, never replace it.
+        let mut stored_extra = watch_all(addr(2), 300);
+        stored_extra.name = "imported.eth".to_string();
+        let stored = vec![watch_all(addr(1), 200), stored_extra.clone()];
+        let pushed = LogIndexConfig {
+            enabled: true,
+            max_speed: true,
+            backfill_paused: false,
+            watch: vec![{
+                let mut w = watch_all(addr(1), 100); // lower from_block
+                w.name = "preset name".to_string();
+                w
+            }],
+        };
+        let eff = pushed.union_with(&stored).unwrap();
+        assert!(eff.enabled && eff.max_speed);
+        assert_eq!(eff.watch.len(), 2);
+        assert_eq!(eff.watch[0].from_block, 100); // min wins
+        assert_eq!(eff.watch[0].name, "preset name"); // push is authoritative
+        assert_eq!(eff.watch[1], stored_extra); // imported entry survives
+        // Topic conflict → None (caller replaces instead).
+        let restricted = vec![WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 100, topic0s: vec![topic(7)], name: String::new() }];
+        assert!(pushed.union_with(&restricted).is_none());
+    }
+
+    #[test]
+    fn adopt_config_keeps_state_only_for_the_same_subscription_set() {
+        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 200), watch_all(addr(2), 200)])).unwrap();
+        ix.append_block(500, [5; 32], vec![log(500, 0, addr(1), vec![])]).unwrap();
+        // Reordered + renamed + lowered from_block + flipped bits: adoptable,
+        // and coverage re-pairs by address.
+        let mut renamed = watch_all(addr(2), 150);
+        renamed.name = "renamed.eth".to_string();
+        let eff = LogIndexConfig { enabled: true, max_speed: true, backfill_paused: false, watch: vec![renamed, watch_all(addr(1), 200)] };
+        assert!(ix.adopt_config(eff));
+        assert!(ix.config().enabled && ix.config().max_speed);
+        assert_eq!(ix.config().watch[0].from_block, 150);
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((500, 500)));
+        assert_eq!(ix.log_count(), 1);
+        // A new address is NOT adoptable (needs a re-index), and the failed
+        // attempt leaves everything untouched.
+        let wider = config(vec![watch_all(addr(1), 200), watch_all(addr(2), 150), watch_all(addr(3), 0)]);
+        assert!(!ix.adopt_config(wider));
+        assert_eq!(ix.config().watch.len(), 2);
+        // A changed topic set is NOT adoptable either.
+        let retopiced = config(vec![
+            WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 200, topic0s: vec![topic(9)], name: String::new() },
+            watch_all(addr(2), 150),
+        ]);
+        assert!(!ix.adopt_config(retopiced));
+    }
+
+    #[test]
+    fn unwatch_drops_the_entry_its_coverage_and_its_logs_and_nothing_else() {
+        let logs = vec![
+            log(120, 0, addr(1), vec![]),
+            log(120, 1, addr(2), vec![]),
+            log(180, 0, addr(1), vec![]),
+            log(200, 0, addr(2), vec![]),
+        ];
+        let mut ix =
+            span_ix(config(vec![watch_all(addr(1), 100), watch_all(addr(2), 100)]), 100, 200, logs);
+        let before = ix.config().fingerprint();
+        assert_eq!(ix.log_count(), 4);
+
+        assert_eq!(ix.unwatch(&[addr(1).into()]), 1);
+
+        // The entry and its coverage are gone, so a query for it is refused as
+        // unwatched rather than answered from an index that no longer follows it.
+        assert!(!ix.watches_key(&addr(1).into()));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))), None);
+        assert_eq!(ix.query(&filter(100, 200, addr(1))), Err(QueryError::UnwatchedAddress(addr(1))));
+        // The other entry lost nothing: same span, same logs.
+        assert_eq!(ix.config().watch, vec![watch_all(addr(2), 100)]);
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, Some((100, 200)));
+        let kept = ix.query(&filter(100, 200, addr(2))).unwrap();
+        assert_eq!(kept.iter().map(|l| (l.block_number, l.log_index)).collect::<Vec<_>>(), vec![(120, 1), (200, 0)]);
+        assert_eq!(ix.log_count(), 2, "only the unwatched address's logs were dropped");
+        // In-flight work computed against the old list must not apply.
+        assert_ne!(ix.config().fingerprint(), before);
+
+        // The checkpoint carries the same story: nothing of the address is
+        // left for a restart's union to bring back.
+        let (_, back) = LogIndex::deserialize_portable(&ix.serialize(&tag())).expect("portable");
+        assert_eq!(back.config().watch, vec![watch_all(addr(2), 100)]);
+        assert_eq!(back.log_count(), 2);
+
+        // Idempotent: unknown addresses are ignored and change nothing.
+        let fp = ix.config().fingerprint();
+        assert_eq!(ix.unwatch(&[addr(1).into(), addr(9).into()]), 0);
+        assert_eq!(ix.config().fingerprint(), fp);
+        assert_eq!(ix.log_count(), 2);
+    }
+
+    /// Dropping the entry the walk was descending for stops the walk; dropping
+    /// a finished one leaves the walk able to finish. Either way head-follow
+    /// keeps appending — the entries left behind still share one high.
+    #[test]
+    fn unwatch_keeps_the_walk_resumable_for_the_entries_left_behind() {
+        // addr(1) wants history down to 50, addr(2) only to 150. The walk has
+        // reached 120: addr(2) is complete, addr(1) is 70 blocks short.
+        let build = || span_ix(config(vec![watch_all(addr(1), 50), watch_all(addr(2), 150)]), 120, 200, vec![]);
+
+        let mut ix = build();
+        assert_eq!(ix.walk_target(), Some(50));
+        assert_eq!(ix.unwatch(&[addr(1).into()]), 1);
+        assert!(ix.backfill_complete(), "the only incomplete entry left — nothing more to walk");
+        assert_eq!(ix.cursor.map(|(n, _)| n), Some(120), "the trust edge is still usable");
+        ix.append_block(201, [7; 32], vec![]).expect("head-follow continues");
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, Some((150, 201)));
+
+        let mut ix = build();
+        assert_eq!(ix.unwatch(&[addr(2).into()]), 1);
+        assert_eq!(ix.walk_target(), Some(50));
+        assert_eq!(ix.cursor.map(|(n, _)| n), Some(120));
+        assert_catch_up_completes(&mut ix);
+    }
+
+    #[test]
+    fn unwatch_of_the_last_covered_entry_drops_the_cursor() {
+        // addr(2) starts above everything indexed so far, so it has no span:
+        // once addr(1) goes, nothing is covered and the cursor chains into
+        // nothing.
+        let mut ix =
+            span_ix(config(vec![watch_all(addr(1), 100), watch_all(addr(2), 500)]), 150, 200, vec![]);
+        assert_eq!(ix.unwatch(&[addr(1).into()]), 1);
+        assert_eq!(ix.cursor, None);
+        assert_eq!(ix.append_edge(), None);
+        assert_eq!(ix.log_count(), 0);
+        // The appender starts over at the head and re-seeds the trust edge.
+        ix.append_block(600, [6; 32], vec![log(600, 0, addr(2), vec![])]).unwrap();
+        assert_eq!(ix.cursor, Some((600, [6; 32])));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, Some((600, 600)));
+
+        // Unwatching everything leaves a valid, empty index — one the appender
+        // has nothing to follow the head for, enabled or not.
+        assert!(ix.follows_head());
+        assert_eq!(ix.unwatch(&[addr(2).into()]), 1);
+        assert!(ix.config().watch.is_empty());
+        assert_eq!(ix.log_count(), 0);
+        assert_eq!(ix.cursor, None);
+        assert!(ix.config().enabled && !ix.follows_head());
+    }
+
+    /// Drive the (simulated) appender + walker over `ix` to completion,
+    /// panicking if either wedges: one append at the edge (which also
+    /// re-seeds a dropped cursor — exactly what the real appender does),
+    /// then the walker's descent to the lowest from_block. Hashes are
+    /// synthetic — the coverage state machine is what's under test. Ends by
+    /// asserting every entry is COMPLETE (low <= from_block): the branch's
+    /// promise that catch-up finishes every imported address.
+    fn assert_catch_up_completes(ix: &mut LogIndex) {
+        let top = ix.append_edge().unwrap_or(10_000);
+        ix.append_block(top, [1; 32], vec![])
+            .unwrap_or_else(|g| panic!("appender wedged at {top}: {g:?}"));
+        let target = ix.config().watch.iter().map(|w| w.from_block).min().expect("entries");
+        let mut steps = 0u32;
+        while let Some((n, _)) = ix.cursor {
+            if n <= target {
+                break;
+            }
+            let b = n - 1;
+            ix.backfill_block(b, [2; 32], vec![])
+                .unwrap_or_else(|g| panic!("walker wedged at {b}: {g:?}"));
+            steps += 1;
+            assert!(steps < 100_000, "walk did not terminate");
+        }
+        for (w, c) in ix.coverage_entries() {
+            let (low, _) = c.span.unwrap_or_else(|| {
+                panic!("entry 0x{:02x}.. never covered", w.key.address().unwrap()[0])
+            });
+            assert!(low <= w.from_block, "entry incomplete: low {low} > from {}", w.from_block);
+        }
+    }
+
+    /// Build a canonical index over `cfg` covering `low..=high` (appender
+    /// seed at the top, walker descent to the bottom — cursor ends at `low`),
+    /// with `logs` inserted at their blocks along the way.
+    fn span_ix(cfg: LogIndexConfig, low: u64, high: u64, logs: Vec<StoredLog>) -> LogIndex {
+        let mut ix = LogIndex::new(cfg).unwrap();
+        let at = |b: u64| logs.iter().filter(|l| l.block_number == b).cloned().collect::<Vec<_>>();
+        ix.append_block(high, [high as u8; 32], at(high)).unwrap();
+        for b in (low..high).rev() {
+            ix.backfill_block(b, [b as u8; 32], at(b)).unwrap();
+        }
+        ix
+    }
+
+    #[test]
+    fn merge_unions_addresses_and_clamps_to_the_min_high() {
+        // A: tornado history, generated earlier (high 300). B: railgun,
+        // generated later (high 500). The union must not claim (300, 500]
+        // for A's address — that band re-indexes via the bridge.
+        let a = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 300, vec![log(200, 0, addr(1), vec![])]);
+        let b = span_ix(config(vec![watch_all(addr(2), 400)]), 400, 500, vec![log(450, 0, addr(2), vec![])]);
+        let (t, m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        assert_eq!(t, tag());
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((100, 300)));
+        // B's span lies entirely above H=300 → dormant, its log dropped
+        // (unreachable by the coverage-honest query anyway).
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, None);
+        assert_eq!(m.log_count(), 1);
+        // Config is the union; runtime bits are the installer's.
+        assert_eq!(m.config().watch.len(), 2);
+        assert!(!m.config().enabled);
+        // Cursor: the deepest trust edge.
+        assert_eq!(m.cursor, Some((100, [100; 32])));
+    }
+
+    #[test]
+    fn backfill_complete_is_false_until_coverage_reaches_from_block() {
+        let ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
+        assert!(!ix.backfill_complete(), "nothing indexed yet");
+        let ix = span_ix(config(vec![watch_all(addr(1), 100)]), 150, 200, vec![]);
+        assert!(!ix.backfill_complete(), "covered down to 150, from_block is 100 — 50 blocks short");
+        let ix = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 200, vec![]);
+        assert!(ix.backfill_complete(), "covered all the way to from_block");
+    }
+
+    /// The bug a filtered `.any()` (checked only the entry that happens to
+    /// own the current `target_low`) would reintroduce: two entries can
+    /// legitimately share a `from_block` — nothing but the address is
+    /// checked for duplicates — and being tied for the minimum does not mean
+    /// they are equally done. Built the way this actually arises in
+    /// production, `LogIndex::merge` unioning two independently-backfilled
+    /// sources (`ElReader::set_log_index_config`'s path for a newly added
+    /// watch address), not by poking private state directly.
+    #[test]
+    fn backfill_complete_requires_every_entry_at_a_tied_from_block_not_just_one() {
+        // Both entries have from_block=100 and share the same high (150), so
+        // merge's H-clamping leaves both spans untouched: A was walked all
+        // the way down to 100 (complete); B only down to 120 — 20 blocks
+        // short of ITS OWN from_block=100, despite tying A for target_low.
+        let complete = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 150, vec![]);
+        let incomplete = span_ix(config(vec![watch_all(addr(2), 100)]), 120, 150, vec![]);
+        let (_, merged) = LogIndex::merge(vec![(tag(), complete), (tag(), incomplete)]).unwrap();
+        assert_eq!(merged.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((100, 150)), "sanity: A complete");
+        assert_eq!(
+            merged.coverage_of(&WatchKey::Address(addr(2))).unwrap().span,
+            Some((120, 150)),
+            "sanity: B still short of its own from_block"
+        );
+        assert!(
+            !merged.backfill_complete(),
+            "B has not reached its own from_block — reporting complete here is exactly what this method exists to prevent"
+        );
+    }
+
+    #[test]
+    fn merge_same_address_unions_overlapping_spans() {
+        let a = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 200, vec![log(60, 0, addr(1), vec![])]);
+        let b = span_ix(config(vec![watch_all(addr(1), 50)]), 150, 260, vec![log(250, 0, addr(1), vec![])]);
+        let (_, mut m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        // H = min(200, 260) = 200; spans [50,200] ∪ [150,200] = [50,200].
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((50, 200)));
+        // B's log at 250 is above the merged span → dropped; A's at 60 kept.
+        assert_eq!(m.log_count(), 1);
+        m.set_enabled(true); // the installer's decision, made here for the query
+        assert_eq!(m.query(&filter(50, 200, addr(1))).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_same_address_disjoint_spans_keep_the_lower() {
+        // A reaches only [50,120]; B covers [300,400]. H = 120 makes B's
+        // piece vanish — the deployment-anchored lower history survives and
+        // catch-up re-indexes upward from 120.
+        let a = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 120, vec![log(70, 0, addr(1), vec![])]);
+        let b = span_ix(config(vec![watch_all(addr(1), 50)]), 300, 400, vec![log(350, 0, addr(1), vec![])]);
+        let (_, mut m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((50, 120)));
+        assert_eq!(m.log_count(), 1);
+        m.set_enabled(true); // the installer's decision, made here for the query
+        assert!(matches!(m.query(&filter(300, 400, addr(1))), Err(QueryError::OutOfCoverage { .. })));
+    }
+
+    #[test]
+    fn merge_refuses_other_chains_and_topic_conflicts() {
+        let a = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 100, vec![]);
+        let b = span_ix(config(vec![watch_all(addr(2), 50)]), 50, 100, vec![]);
+        let sepolia = ChainTag { network_id: 11_155_111, genesis_hash: [0x25; 32] };
+        assert!(matches!(
+            LogIndex::merge(vec![(tag(), a), (sepolia, b)]),
+            Err(MergeError::ChainMismatch { .. })
+        ));
+        assert!(matches!(LogIndex::merge(vec![]), Err(MergeError::Empty)));
+        // Same address under different topic restrictions: a span's meaning
+        // includes what it indexed — refuse, never widen.
+        let all = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 100, vec![]);
+        let restricted = span_ix(
+            config(vec![WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 50, topic0s: vec![topic(7)], name: String::new() }]),
+            50,
+            100,
+            vec![],
+        );
+        assert!(matches!(
+            LogIndex::merge(vec![(tag(), all), (tag(), restricted)]),
+            Err(MergeError::TopicConflict(a)) if a == addr(1).into()
+        ));
+    }
+
+    #[test]
+    fn merge_takes_min_from_block_and_first_nonempty_name() {
+        let mut named = watch_all(addr(1), 200);
+        named.name = "tornado.registry.eth".to_string();
+        let a = span_ix(config(vec![watch_all(addr(1), 400)]), 400, 500, vec![]);
+        let b = span_ix(config(vec![named]), 400, 500, vec![]);
+        let (_, m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        let w = &m.config().watch[0];
+        assert_eq!(w.from_block, 200);
+        assert_eq!(w.name, "tornado.registry.eth");
+    }
+
+    #[test]
+    fn merge_prunes_a_stale_source_instead_of_rewinding_the_fresh_one() {
+        // Re-importing an old file whose coverage is a subset must NOT drag
+        // the merged high back to the old file's high.
+        let fresh = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 500, vec![log(450, 0, addr(1), vec![])]);
+        let stale = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 300, vec![]);
+        let (_, m) = LogIndex::merge(vec![(tag(), stale), (tag(), fresh)]).unwrap();
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((100, 500)));
+        assert_eq!(m.log_count(), 1);
+    }
+
+    #[test]
+    fn merge_into_a_mid_backfill_index_resumes_and_completes() {
+        // The flagship import case that once wedged: own index mid-backfill
+        // (X from 20, covered [1000,1100], cursor at 1000) + a deep imported
+        // snapshot (Y from 50, covered [50,1100], cursor at 50). The naive
+        // "deepest cursor" (50) leaves X's hole [20,1000) ABOVE the walk —
+        // backfill_block gap-errors every tick, forever. The resumable
+        // choice is the cursor at the MAX incomplete low (X's 1000): the
+        // walk re-descends through Y's covered span and closes both holes.
+        let own = span_ix(config(vec![watch_all(addr(1), 20)]), 1000, 1100, vec![]);
+        let imported = span_ix(config(vec![watch_all(addr(2), 50)]), 50, 1100, vec![]);
+        let (_, mut m) = LogIndex::merge(vec![(tag(), own), (tag(), imported)]).unwrap();
+        assert_eq!(m.cursor.map(|(n, _)| n), Some(1000), "must resume at the max incomplete low");
+        assert_catch_up_completes(&mut m);
+    }
+
+    #[test]
+    fn merge_with_a_config_only_source_drops_the_cursor_and_completes() {
+        // A config-only source (new address, no coverage — the preset-grew
+        // case): its whole range sits above any source cursor, so NO cursor
+        // is resumable; the merge must drop it (appender re-seeds at the
+        // top, walker re-descends) rather than strand the new entry.
+        let covered = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 300, vec![]);
+        let config_only = LogIndex::new(config(vec![watch_all(addr(2), 100)])).unwrap();
+        let (_, mut m) = LogIndex::merge(vec![(tag(), config_only), (tag(), covered)]).unwrap();
+        assert_eq!(m.cursor, None, "no cursor can reach the new entry's hole");
+        // Coverage survived the union.
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((50, 300)));
+        assert_catch_up_completes(&mut m);
+    }
+
+    #[test]
+    fn adopt_lowering_from_block_below_a_complete_span_drops_the_cursor() {
+        // Regression: pre-import builds re-indexed on any from_block change;
+        // the additive path must not instead wedge. Two entries, walk at
+        // 150: X1 (from 200) is COMPLETE at low 200, X2 (from 100) is
+        // mid-descent at the cursor. Lowering X1's from_block to 50 opens
+        // the hole [50,200) ABOVE the cursor — unreachable by the descent —
+        // so the adopt keeps all coverage but drops the cursor and the walk
+        // re-descends.
+        let mut ix = span_ix(
+            config(vec![watch_all(addr(1), 200), watch_all(addr(2), 100)]),
+            150,
+            300,
+            vec![],
+        );
+        assert_eq!(ix.cursor.map(|(n, _)| n), Some(150));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 300)));
+        let lowered = config(vec![watch_all(addr(1), 50), watch_all(addr(2), 100)]);
+        assert!(ix.adopt_config(lowered));
+        assert_eq!(ix.cursor, None, "X1's hole [50,200) sits above the old cursor");
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 300)), "coverage kept");
+        assert_catch_up_completes(&mut ix);
+        // Mid-descent lowering (span low == cursor) keeps the cursor: the
+        // walk just runs deeper.
+        let mut mid = span_ix(config(vec![watch_all(addr(3), 150)]), 200, 300, vec![]);
+        assert!(mid.adopt_config(config(vec![watch_all(addr(3), 100)])));
+        assert_eq!(mid.cursor.map(|(n, _)| n), Some(200));
+        assert_catch_up_completes(&mut mid);
+    }
+
+    #[test]
+    fn merge_output_is_canonical_and_never_fabricates_coverage() {
+        // Pseudo-random source shapes (fixed LCG seed — deterministic): the
+        // merged result must (a) never claim a block for an address that no
+        // source covered for that address, and (b) stay canonical: all
+        // present spans share one high, the cursor sits at/below every low.
+        let mut state: u64 = 0x5eed;
+        let mut rng = move |bound: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        for _ in 0..50 {
+            let n_sources = 1 + rng(3);
+            let mut sources = Vec::new();
+            for _ in 0..n_sources {
+                let n_watch = 1 + rng(3) as u8;
+                let entries: Vec<WatchEntry> = (1..=n_watch).map(|k| watch_all(addr(k), 10)).collect();
+                let low = 10 + rng(50);
+                let high = low + rng(60);
+                sources.push(span_ix(config(entries), low, high, vec![]));
+            }
+            let originals: Vec<LogIndex> = sources
+                .iter()
+                .map(|s| {
+                    let cfg = s.config().clone();
+                    let mut c = LogIndex::new(cfg).unwrap();
+                    c.coverage = s.coverage.clone();
+                    c
+                })
+                .collect();
+            let (_, mut m) = LogIndex::merge(sources.into_iter().map(|s| (tag(), s)).collect()).unwrap();
+            let highs: Vec<u64> =
+                m.coverage_entries().iter().filter_map(|(_, c)| c.span.map(|(_, h)| h)).collect();
+            assert!(highs.windows(2).all(|w| w[0] == w[1]), "unequal highs: {highs:?}");
+            // The RESUMABILITY invariant — the walker demands every
+            // incomplete low at/below the cursor (asserting the inverted
+            // "cursor at/below every low" here is exactly the bug this
+            // branch once had).
+            let (watch, coverage): (Vec<_>, Vec<_>) = m.coverage_entries().into_iter().unzip();
+            assert!(walk_resumable(&watch, &coverage, m.cursor), "merge emitted a non-resumable state");
+            for (w, c) in m.coverage_entries() {
+                if let Some((low, high)) = c.span {
+                    for b in low..=high {
+                        let covered_somewhere = originals.iter().any(|s| {
+                            s.coverage_of(&w.key).is_some_and(|sc| sc.contains(b, b))
+                        });
+                        assert!(covered_somewhere, "merged claims block {b} for an address no source covered");
+                    }
+                }
+            }
+            // And the invariant is not just declared — the pipeline actually
+            // runs to completion from the merged state.
+            assert_catch_up_completes(&mut m);
+        }
+    }
+
+    #[test]
+    fn reordered_config_pairs_coverage_by_address() {
+        // The fingerprint is order-insensitive, so a host may re-apply the
+        // same watch-set in a different order. v2 stores the watch-table and
+        // re-pairs coverage by ADDRESS — entry order must not migrate a span
+        // to the wrong contract.
+        let w1 = watch_all(addr(1), 100);
+        let w2 = watch_all(addr(2), 300);
+        let mut ix = LogIndex::new(config(vec![w1.clone(), w2.clone()])).unwrap();
+        // Blocks 200..=210: only addr(1)'s entry is live (addr(2) starts at 300).
+        for b in 200..=210 {
+            ix.append_block(b, [0xbb; 32], vec![]).unwrap();
+        }
+        let bytes = ix.serialize(&tag());
+        let reordered = config(vec![w2, w1]);
+        assert_eq!(reordered.fingerprint(), ix.config().fingerprint());
+        let back = LogIndex::deserialize(&reordered, &tag(), &bytes).unwrap();
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 210)));
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Topic entries (#673): a topic value, any emitter.
+    // -----------------------------------------------------------------------
+
+    /// The wallet the topic tests watch, as the 32-byte topic it appears as.
+    const WALLET: [u8; 32] = {
+        let mut t = [0u8; 32];
+        let mut i = 12;
+        while i < 32 {
+            t[i] = 0x77;
+            i += 1;
+        }
+        t
+    };
+    const TRANSFER: [u8; 32] = [0xdd; 32];
+
+    fn watch_topic(value: [u8; 32], positions: &[u8], from: u64) -> WatchEntry {
+        WatchEntry {
+            key: WatchKey::Topic(value),
+            from_block: from,
+            topic0s: vec![],
+            positions: positions.to_vec(),
+            name: String::new(),
+        }
+    }
+
+    fn pinned(from: u64, to: u64, addresses: Vec<[u8; 20]>, topics: Vec<Option<[u8; 32]>>) -> LogFilter {
+        LogFilter {
+            from_block: from,
+            to_block: to,
+            addresses,
+            topics: topics.into_iter().map(|t| t.into_iter().collect()).collect(),
+        }
+    }
+
+    /// One block of the wallet's token history: a transfer out (wallet at
+    /// topic1, token A), a transfer in (topic2, token B), an ERC-1155-style
+    /// log with the wallet at topic3, and a log about someone else.
+    fn wallet_block(bn: u64) -> Vec<StoredLog> {
+        vec![
+            log(bn, 0, addr(0xa1), vec![TRANSFER, WALLET, topic(0x01)]),
+            log(bn, 1, addr(0xb2), vec![TRANSFER, topic(0x02), WALLET]),
+            log(bn, 2, addr(0xc3), vec![topic(0x33), topic(0x03), topic(0x04), WALLET]),
+            log(bn, 3, addr(0xa1), vec![TRANSFER, topic(0x05), topic(0x06)]),
+        ]
+    }
+
+    #[test]
+    fn a_topic_entry_stores_logs_from_any_emitter_at_its_positions_only() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 100)])).unwrap();
+        ix.append_block(100, [0xbb; 32], wallet_block(100)).unwrap();
+        // Two emitters, the value at topic1 and at topic2. Not the log with
+        // the value at topic3 (position not watched), not the stranger's.
+        assert_eq!(ix.log_count(), 2);
+        let out = ix.query(&pinned(100, 100, vec![], vec![None, Some(WALLET)])).unwrap();
+        assert_eq!(out.iter().map(|l| l.address).collect::<Vec<_>>(), vec![addr(0xa1)]);
+        let inbound = ix.query(&pinned(100, 100, vec![], vec![Some(TRANSFER), None, Some(WALLET)])).unwrap();
+        assert_eq!(inbound.iter().map(|l| l.address).collect::<Vec<_>>(), vec![addr(0xb2)]);
+        // An address list narrows the answer and needs no address entry:
+        // every log the filter can match carries the value at topic2.
+        let from_b = ix.query(&pinned(100, 100, vec![addr(0xb2), addr(0xee)], vec![None, None, Some(WALLET)])).unwrap();
+        assert_eq!(from_b.len(), 1);
+        assert!(ix.query(&pinned(100, 100, vec![addr(0xa1)], vec![None, None, Some(WALLET)])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_topic_entry_refuses_what_its_store_cannot_answer() {
+        let key = WatchKey::Topic(WALLET);
+        let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 100)])).unwrap();
+        ix.append_block(100, [0xbb; 32], wallet_block(100)).unwrap();
+        // Pinned at a position the entry does not watch.
+        assert_eq!(
+            ix.query(&pinned(100, 100, vec![], vec![None, None, None, Some(WALLET)])),
+            Err(QueryError::UnindexedTopic(key))
+        );
+        // Not pinned: an OR-list with another value could match logs nobody
+        // stored, and so could a wildcard.
+        let or_list = LogFilter {
+            from_block: 100,
+            to_block: 100,
+            addresses: vec![],
+            topics: vec![vec![], vec![WALLET, topic(0x05)]],
+        };
+        assert_eq!(ix.query(&or_list), Err(QueryError::UnwatchedTopic));
+        assert_eq!(ix.query(&pinned(100, 100, vec![], vec![Some(TRANSFER)])), Err(QueryError::UnwatchedTopic));
+        // A value nobody watches, with an address nobody watches either.
+        assert_eq!(
+            ix.query(&pinned(100, 100, vec![addr(0xa1)], vec![None, Some(topic(0x05))])),
+            Err(QueryError::UnwatchedAddress(addr(0xa1)))
+        );
+        // Outside coverage: the honest refusal, never `[]` — and it wins over
+        // the address path's refusal, since waiting it out will answer.
+        match ix.query(&pinned(100, 101, vec![addr(0xa1)], vec![None, Some(WALLET)])) {
+            Err(QueryError::OutOfCoverage { key: k, covered }) => {
+                assert_eq!(k, key);
+                assert_eq!(covered.span, Some((100, 100)));
+            }
+            other => panic!("expected OutOfCoverage, got {other:?}"),
+        }
+        // Below from_block the entry asserts nothing exists: answerable.
+        assert_eq!(ix.query(&pinned(0, 100, vec![], vec![None, Some(WALLET)])).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_topic_entrys_topic0_restriction_applies_to_storage_and_queries() {
+        let mut w = watch_topic(WALLET, &[1, 2], 0);
+        w.topic0s = vec![TRANSFER];
+        let mut ix = LogIndex::new(config_ok(vec![w])).unwrap();
+        let mut logs = wallet_block(5);
+        logs.push(log(5, 4, addr(0xa1), vec![topic(0x44), WALLET])); // an Approval-like log
+        ix.append_block(5, [0xbb; 32], logs).unwrap();
+        assert_eq!(ix.log_count(), 2, "only the Transfer logs");
+        assert_eq!(ix.query(&pinned(5, 5, vec![], vec![Some(TRANSFER), Some(WALLET)])).unwrap().len(), 1);
+        assert_eq!(
+            ix.query(&pinned(5, 5, vec![], vec![None, Some(WALLET)])),
+            Err(QueryError::UnindexedTopic(WatchKey::Topic(WALLET)))
+        );
+    }
+
+    #[test]
+    fn an_address_entry_and_a_topic_entry_share_one_store() {
+        // Token A watched as a contract, the wallet watched as a topic: the
+        // wallet's transfer on A is both entries' log, stored once.
+        let mut ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(0xa1), 0), watch_topic(WALLET, &[1, 2, 3], 0)])).unwrap();
+        ix.append_block(7, [0xbb; 32], wallet_block(7)).unwrap();
+        // A's two logs + the wallet's three, one of them shared.
+        assert_eq!(ix.log_count(), 4);
+        assert_eq!(ix.query(&filter(7, 7, addr(0xa1))).unwrap().len(), 2);
+        // Dropping the topic entry keeps the shared log (A still selects it)
+        // and drops the two only the wallet's entry selected.
+        assert_eq!(ix.unwatch(&[WatchKey::Topic(WALLET)]), 1);
+        assert_eq!(ix.log_count(), 2);
+        assert_eq!(ix.query(&filter(7, 7, addr(0xa1))).unwrap().len(), 2);
+        assert_eq!(ix.query(&pinned(7, 7, vec![], vec![None, Some(WALLET)])), Err(QueryError::UnwatchedTopic));
+    }
+
+    #[test]
+    fn an_unwatch_keeps_a_shared_log_only_where_a_survivor_covers_it() {
+        // The wallet's entry covers 100..=200; token A's entry, added later,
+        // covers only 150..=200 although it selects from block 0. A's
+        // transfer at 120 was stored for the wallet: once the wallet goes, no
+        // entry covers it, so it goes too — the rule merge keeps logs by.
+        let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 100)])).unwrap();
+        for b in 100..=200 {
+            let logs = if b == 120 || b == 180 { wallet_block(b) } else { vec![] };
+            ix.append_block(b, [0xbb; 32], logs).unwrap();
+        }
+        ix.config.watch.push(watch_all(addr(0xa1), 0));
+        ix.coverage.push(Coverage { span: Some((150, 200)) });
+        assert_eq!(ix.log_count(), 4);
+        assert_eq!(ix.unwatch(&[WatchKey::Topic(WALLET)]), 1);
+        let left: Vec<(u64, u32)> = ix.logs.keys().copied().collect();
+        assert_eq!(left, vec![(180, 0)], "only A's covered transfer stays");
+    }
+
+    #[test]
+    fn a_topic_entry_bloom_probes_for_its_value() {
+        let ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[2], 10)])).unwrap();
+        let mut hit: myotis_core::bloom::LogsBloom = [0; 256];
+        myotis_core::bloom::accrue(&mut hit, &WALLET);
+        assert!(ix.bloom_may_match(10, &hit));
+        assert!(!ix.bloom_may_match(9, &hit), "below from_block");
+        // The address the value pads is a different bloom item.
+        let mut padded_address: myotis_core::bloom::LogsBloom = [0; 256];
+        myotis_core::bloom::accrue(&mut padded_address, &WALLET[12..]);
+        assert!(!ix.bloom_may_match(10, &padded_address));
+        // And the receipts-side rule agrees with the store.
+        assert!(ix.config().watches_parts(10, &addr(1), &[TRANSFER, topic(1), WALLET]));
+        assert!(!ix.config().watches_parts(10, &addr(1), &[TRANSFER, WALLET, topic(1)]));
+    }
+
+    #[test]
+    fn topic_positions_are_validated() {
+        let bad = |positions: &[u8]| config(vec![watch_topic(WALLET, positions, 0)]).invalid();
+        let key = WatchKey::Topic(WALLET);
+        for p in [&[][..], &[0], &[4], &[2, 1], &[1, 1]] {
+            assert_eq!(bad(p), Some(InvalidWatchList::BadPositions(key)), "positions {p:?}");
+        }
+        assert_eq!(bad(&[1, 2, 3]), None);
+        let mut address_with_positions = watch_all(addr(1), 0);
+        address_with_positions.positions = vec![1];
+        assert!(matches!(
+            LogIndex::new(config(vec![address_with_positions])),
+            Err(InvalidWatchList::BadPositions(WatchKey::Address(_)))
+        ));
+        // A topic entry and an address entry never collide, even when the
+        // value is the address left-padded.
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(&addr(1));
+        assert_eq!(config(vec![watch_all(addr(1), 0), watch_topic(padded, &[1], 0)]).invalid(), None);
+        assert_eq!(
+            config(vec![watch_topic(WALLET, &[1], 0), watch_topic(WALLET, &[2], 5)]).invalid(),
+            Some(InvalidWatchList::Duplicate(key))
+        );
+    }
+
+    #[test]
+    fn an_address_only_fingerprint_is_unchanged_by_topic_entries() {
+        // The encoding every earlier build keyed its files and finality
+        // claims by: address, from_block, sorted topic0s per entry.
+        let cfg = config(vec![
+            WatchEntry { topic0s: vec![topic(9), topic(3)], ..watch_all(addr(2), 77) },
+            watch_all(addr(1), 5),
+        ]);
+        let mut encoded: Vec<Vec<u8>> = cfg
+            .watch
+            .iter()
+            .map(|w| {
+                let mut e = w.key.address().unwrap().to_vec();
+                e.extend_from_slice(&w.from_block.to_le_bytes());
+                let mut ts = w.topic0s.clone();
+                ts.sort_unstable();
+                ts.iter().for_each(|t| e.extend_from_slice(t));
+                e
+            })
+            .collect();
+        encoded.sort_unstable();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in encoded {
+            for b in e.into_iter().chain([0xff]) {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(cfg.fingerprint(), h);
+        // Positions are part of what a topic entry's span means.
+        assert_ne!(
+            config(vec![watch_topic(WALLET, &[1], 0)]).fingerprint(),
+            config(vec![watch_topic(WALLET, &[1, 2], 0)]).fingerprint()
+        );
+    }
+
+    #[test]
+    fn a_topic_entry_survives_the_snapshot_and_only_it_makes_a_v3_frame() {
+        let address_only = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        assert_eq!(address_only.serialize(&tag())[4..8], VERSION.to_le_bytes(), "address-only stays v2");
+
+        let mut ix = LogIndex::new(config_ok(vec![
+            watch_all(addr(0xa1), 3),
+            WatchEntry { name: "me".into(), ..watch_topic(WALLET, &[1, 3], 0) },
+        ]))
+        .unwrap();
+        ix.append_block(4, [0xbb; 32], wallet_block(4)).unwrap();
+        let bytes = ix.serialize(&tag());
+        assert_eq!(bytes[4..8], VERSION_TOPICS.to_le_bytes());
+        assert!(SnapshotId::of_frame(&bytes).is_some(), "a v3 frame can carry a finality claim");
+
+        let (t, back) = LogIndex::deserialize_portable(&bytes).expect("v3 is importable");
+        assert_eq!(t, tag());
+        assert_eq!(back.config.watch, ix.config.watch);
+        assert_eq!(back.coverage, ix.coverage);
+        assert_eq!(back.logs, ix.logs);
+        // The config-keyed load reads it too (a node's own checkpoint).
+        let own = LogIndex::deserialize(ix.config(), &tag(), &bytes).expect("v3 loads for its config");
+        assert_eq!(own.log_count(), ix.log_count());
+        // A frame whose topic entry carries invalid positions is refused.
+        let mut corrupt = ix;
+        corrupt.config.watch[1].positions = vec![0];
+        assert!(LogIndex::deserialize_portable(&corrupt.serialize(&tag())).is_none());
+    }
+
+    #[test]
+    fn merging_topic_entries_follows_the_address_rules() {
+        let a = {
+            let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 0)])).unwrap();
+            ix.append_block(10, [0xbb; 32], wallet_block(10)).unwrap();
+            ix
+        };
+        // Same value under other positions: different spans, a conflict.
+        let other = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1], 0)])).unwrap();
+        assert_eq!(
+            LogIndex::merge(vec![(tag(), a), (tag(), other)]).err(),
+            Some(MergeError::TopicConflict(WatchKey::Topic(WALLET)))
+        );
+        let a = {
+            let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 0)])).unwrap();
+            ix.append_block(10, [0xbb; 32], wallet_block(10)).unwrap();
+            ix
+        };
+        // A config-only source adding an address entry: the wallet's logs
+        // survive under its own entry's span.
+        let b = LogIndex::new(config_ok(vec![watch_all(addr(0xa1), 0)])).unwrap();
+        let (_, merged) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        assert_eq!(merged.coverage_of(&WatchKey::Topic(WALLET)).unwrap().span, Some((10, 10)));
+        assert_eq!(merged.log_count(), 2);
+        // And the union refuses a positions mismatch the same way.
+        let pushed = config(vec![watch_topic(WALLET, &[2], 0)]);
+        assert_eq!(pushed.union_with(&merged.config.watch), None);
+    }
+}
+
+#[cfg(test)]
+mod bloom_match_tests {
+    use super::*;
+    use myotis_core::bloom::{accrue, EMPTY_BLOOM};
+
+    #[test]
+    fn bloom_prefilter_respects_from_block_and_topics() {
+        fn addr(b: u8) -> [u8; 20] {
+            [b; 20]
+        }
+        let watch = WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 100, topic0s: vec![[7; 32]], name: String::new() };
+        let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![watch] }).unwrap();
+        let mut hit = EMPTY_BLOOM;
+        accrue(&mut hit, &addr(1));
+        accrue(&mut hit, &[7u8; 32]);
+        assert!(ix.bloom_may_match(100, &hit));
+        assert!(!ix.bloom_may_match(99, &hit)); // below from_block
+        let mut addr_only = EMPTY_BLOOM;
+        accrue(&mut addr_only, &addr(1));
+        assert!(!ix.bloom_may_match(100, &addr_only)); // topic0-restricted entry needs a topic hit
+        assert!(!ix.bloom_may_match(100, &EMPTY_BLOOM));
+    }
+}
+
+#[cfg(test)]
+mod finality_claim_tests {
+    use super::*;
+
+    /// A per-test scratch dir, removed on every exit path.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("logindex-claim-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tag() -> ChainTag {
+        ChainTag { network_id: 100, genesis_hash: [0x4f; 32] }
+    }
+
+    fn index(high: u64) -> LogIndex {
+        let watch = WatchEntry { key: WatchKey::Address([1; 20]), positions: vec![], from_block: 0, topic0s: vec![], name: String::new() };
+        let mut ix = LogIndex::new(LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: vec![watch],
+        })
+        .unwrap();
+        for b in 10..=high {
+            ix.append_block(b, [b as u8; 32], vec![]).unwrap();
+        }
+        ix
+    }
+
+    #[test]
+    fn a_claim_counts_only_beside_the_exact_file_it_was_written_for() {
+        let dir = TempDir::new("exact");
+        let path = dir.0.join("logindex-gnosis.db");
+        let bytes = index(20).serialize(&tag());
+        write_atomic(&path, &bytes).unwrap();
+        let (_, id) = LogIndex::load_portable_with_id(&path).unwrap();
+        // The writer's view of the id (off the bytes it holds) and the loader's
+        // (off the bytes it parsed) must agree, or no claim ever matches.
+        assert_eq!(SnapshotId::of_frame(&bytes), Some(id));
+        assert_eq!(read_finality_claim(&path, &id), None, "no sidecar yet");
+        write_finality_claim(&path, &id, 20).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), Some(20));
+
+        // The index is replaced — a drop-in, an import, an older build's write.
+        // The sidecar left behind describes the old bytes and says nothing
+        // about the new ones.
+        write_atomic(&path, &index(25).serialize(&tag())).unwrap();
+        let (_, replaced) = LogIndex::load_portable_with_id(&path).unwrap();
+        assert_ne!(replaced, id);
+        assert_eq!(read_finality_claim(&path, &replaced), None);
+
+        // Same payload under another chain's tag is another file too.
+        let other_chain = SnapshotId { tag: ChainTag { network_id: 1, ..tag() }, ..id };
+        assert_eq!(read_finality_claim(&path, &other_chain), None);
+    }
+
+    #[test]
+    fn a_damaged_claim_is_no_claim() {
+        let dir = TempDir::new("damaged");
+        let path = dir.0.join("logindex-gnosis.db");
+        let id = SnapshotId::of_frame(&index(20).serialize(&tag())).unwrap();
+        let claim = finality_claim_path(&path);
+
+        write_finality_claim(&path, &id, 20).unwrap();
+        let good = std::fs::read(&claim).unwrap();
+        assert_eq!(good.len(), CLAIM_LEN);
+        // A flipped bit anywhere — including in the claimed height itself.
+        for at in [0, 8, 56, 64, CLAIM_LEN - 1] {
+            let mut bad = good.clone();
+            bad[at] ^= 0x01;
+            std::fs::write(&claim, &bad).unwrap();
+            assert_eq!(read_finality_claim(&path, &id), None, "bit flip at {at} accepted");
+        }
+        // Truncated, or with trailing bytes.
+        std::fs::write(&claim, &good[..CLAIM_LEN - 1]).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        let mut long = good.clone();
+        long.push(0);
+        std::fs::write(&claim, &long).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // A consistent frame with one field changed, checksum redone.
+        let reframed = |at: usize, bytes: &[u8]| {
+            let mut body = good[..CLAIM_LEN - 8].to_vec();
+            body[at..at + bytes.len()].copy_from_slice(bytes);
+            let sum = fnv64(&body);
+            body.extend_from_slice(&sum.to_le_bytes());
+            body
+        };
+        // An unknown version.
+        std::fs::write(&claim, reframed(4, &2u32.to_le_bytes())).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // Zero is never written...
+        let refused = write_finality_claim(&path, &id, 0).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        // ...so a well-formed zero on disk is not believed either.
+        std::fs::write(&claim, reframed(64, &0u64.to_le_bytes())).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+    }
+
+    #[test]
+    fn the_claim_is_a_sidecar_the_portable_file_never_carries() {
+        let dir = TempDir::new("sidecar");
+        let path = dir.0.join("logindex-gnosis.db");
+        assert_eq!(finality_claim_path(&path), dir.0.join("logindex-gnosis.db.final"));
+        // Never one of the index's own scratch names (which REPLACE the
+        // extension), so a checkpoint's temp file cannot land on it.
+        for _ in 0..4 {
+            assert_ne!(next_tmp_path(&path), finality_claim_path(&path));
+        }
+        let ix = index(20);
+        let bytes = ix.serialize(&tag());
+        write_atomic(&path, &bytes).unwrap();
+        let id = SnapshotId::of_frame(&bytes).unwrap();
+        write_finality_claim(&path, &id, 20).unwrap();
+        // The index bytes do not change with a claim beside them, so a copy of
+        // the file — an export, a file handed to another node — carries no
+        // claim to wherever it lands.
+        assert_eq!(std::fs::read(&path).unwrap(), ix.serialize(&tag()));
+        let elsewhere = dir.0.join("copied.db");
+        std::fs::copy(&path, &elsewhere).unwrap();
+        assert_eq!(read_finality_claim(&elsewhere, &id), None);
+
+        remove_finality_claim(&path).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // Removing what is already gone is not an error.
+        remove_finality_claim(&path).unwrap();
+    }
+}

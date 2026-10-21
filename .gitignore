@@ -1,0 +1,12 @@
+/target/
+/wallet-data/
+/payment-data/
+/config.json
+*.tmp
+
+# Local / build artifacts
+ltcengine/node_modules/
+ltcengine/build/
+ltcengine/build-linux/
+ltcengine/bin/
+ltcengine/wallet/

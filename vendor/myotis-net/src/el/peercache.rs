@@ -1,0 +1,1133 @@
+//! The EL peer cache (EL-A8): persists peers that reached a READY snap session so
+//! a restart warm-starts from proven snap servers instead of re-discovering them
+//! one discv4 timeout at a time. The Rust twin of the Java `app/PeerCache`
+//! (and the engine library's `FilePeerCache`), reading and writing the SAME `peers[-net].cache`
+//! file + format so verified EL peers survive restarts AND engine switches
+//! (the same cross-engine sharing the CL [`crate::clcache`] gives).
+//!
+//! **Record format** (tab-separated, UTF-8), one peer per line:
+//! `ip \t port \t publicKeyHex \t {1|0} [\t snapok|snapbad] [\t fails=N] [\t bal]`
+//! — the trailing `{1|0}` is snap CAPABILITY (snap/1 or snap/2); the optional `snapok`/`snapbad`
+//! token records learned snap-serving QUALITY; `bal` (Rust engine only) marks a
+//! peer that served a verified block access list (eth/71 or snap/2, #691), dialed
+//! first while a host follows address activity. The Java caches ignore it and
+//! drop it on their next rewrite, which costs only that preference.
+//! `publicKeyHex` is the peer's
+//! 64-byte node id as `0x`-prefixed hex (Java `Bytes.toHexString()`). Tabs
+//! can't appear in an IP literal, so IPv6 stays unambiguous. Lines in the
+//! legacy colon format (`ip:port:publicKeyHex[:snap]`, IPv4 only) still parse,
+//! so an existing daemon cache migrates in place on the first rewrite.
+//!
+//! **Keys are canonical.** An entry is keyed by `ip\tport` with the IP in its
+//! canonical form: an IPv4-mapped IPv6 address (`::ffff:a.b.c.d` — how a
+//! NEIGHBORS entry carrying a 16-byte IP spells a v4 peer; discv4 un-maps
+//! only the UDP sender itself) is keyed as the plain `a.b.c.d`. Every path
+//! computes the key through the same helper (`key`) — load,
+//! [`add`](ElPeerCache::add) and the `record_*` verdicts alike — so one node
+//! reached under both spellings holds ONE entry (one connect-failure streak,
+//! one quality verdict). A file that already holds both lines loads as one
+//! entry and is written back as one on the next flush.
+//!
+//! **Capability vs quality** (Java parity): the snap flag means the peer
+//! negotiated snap in Hello; it says nothing about whether it actually serves
+//! the state trie. [`record_snap_served`](ElPeerCache::record_snap_served) /
+//! [`record_snap_failure`](ElPeerCache::record_snap_failure) layer a learned
+//! verdict on top — a peer needs [`FAILURE_THRESHOLD`] consecutive failures (no
+//! intervening serve) to be marked DENIED, and any serve re-confirms it. Denied
+//! peers are DEPRIORITIZED, not evicted (a peer that couldn't serve an old
+//! pivot may serve the current one, and is a fine plain-eth peer regardless).
+//!
+//! **Reachability** (Java parity): [`record_connect_failure`](ElPeerCache::record_connect_failure)
+//! tracks consecutive TCP-level dial failures as a persisted `fails=N` token.
+//! Past [`CONNECT_FAILURE_DEMOTE`] the peer reports DENIED from
+//! [`peers`](ElPeerCache::peers); past [`CONNECT_FAILURE_EVICT`] it is dropped
+//! from the cache — the only eviction path. Any successful connect or serve
+//! resets the streak.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+
+/// Consecutive snap-serve failures before a peer is marked DENIED (Java
+/// `PeerCache.SNAP_FAILURE_THRESHOLD`). `pub(crate)` so the pool's live
+/// eviction threshold can be pinned equal to it by a compile-time assert
+/// (see `el::pool`) — the two must move together or an evicted laggard can be
+/// re-admitted before its cache verdict turns DENIED.
+pub(crate) const FAILURE_THRESHOLD: u32 = 3;
+
+/// Consecutive TCP connect failures before a peer reports DENIED from
+/// [`ElPeerCache::peers`] — a currently-unreachable CONFIRMED peer must not
+/// outrank reachable candidates (Java `PeerCache.CONNECT_FAILURE_DEMOTE`).
+const CONNECT_FAILURE_DEMOTE: u32 = 5;
+
+/// Consecutive TCP connect failures before a peer is evicted from the cache —
+/// the only eviction path; re-discovery re-adds a peer that comes back (Java
+/// `PeerCache.CONNECT_FAILURE_EVICT`).
+const CONNECT_FAILURE_EVICT: u32 = 50;
+
+/// Learned snap-serving quality — the dial-priority verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapQuality {
+    /// Proven to serve usable proofs — dial first.
+    Confirmed,
+    /// Advertised snap but not yet proven either way.
+    Unknown,
+    /// Failed to serve `FAILURE_THRESHOLD` times running — dial last.
+    Denied,
+}
+
+impl SnapQuality {
+    /// Dial rank for a snap-capable peer of this quality (lower = dial sooner):
+    /// Confirmed(0) → Unknown(1) → Denied(2). The pool ranks a non-snap peer
+    /// after all of these.
+    pub fn dial_rank(self) -> u8 {
+        match self {
+            SnapQuality::Confirmed => 0,
+            SnapQuality::Unknown => 1,
+            SnapQuality::Denied => 2,
+        }
+    }
+}
+
+/// A cached peer, ready to re-dial.
+#[derive(Debug, Clone)]
+pub struct CachedElPeer {
+    pub addr: SocketAddr,
+    pub pubkey: [u8; 64],
+    pub snap: bool,
+    pub quality: SnapQuality,
+}
+
+/// One in-memory cache entry (keyed by `ip\tport`).
+#[derive(Debug, Clone)]
+struct Entry {
+    /// The peer's node id as stored (`0x`-prefixed hex — kept verbatim so a
+    /// rewrite is byte-stable with what Java wrote).
+    pubkey_hex: String,
+    snap: bool,
+    quality: SnapQuality,
+    /// Consecutive TCP connect failures (persisted as `fails=N`, shared with
+    /// the Java caches). Reset by any successful connect or serve.
+    fails: u32,
+    /// Served a verified block access list (persisted as `bal`).
+    bal: bool,
+}
+
+impl Entry {
+    /// Fold a second on-disk line for the same node into this one — both
+    /// spellings of one endpoint (see the module doc), each carrying the
+    /// verdicts it earned while the keys were split. The better-informed side
+    /// wins: snap capability if either line has it; `Confirmed` over `Denied`
+    /// over `Unknown` (a serve is proof the node can serve, a denial a
+    /// deprioritization that three live failures re-establish); the LOWER
+    /// connect streak (a success under either spelling reset that spelling's
+    /// count, and both spellings dial the same endpoint).
+    fn absorb(&mut self, other: Entry) {
+        self.snap |= other.snap;
+        self.quality = match (self.quality, other.quality) {
+            (SnapQuality::Confirmed, _) | (_, SnapQuality::Confirmed) => SnapQuality::Confirmed,
+            (SnapQuality::Denied, _) | (_, SnapQuality::Denied) => SnapQuality::Denied,
+            _ => SnapQuality::Unknown,
+        };
+        self.fails = self.fails.min(other.fails);
+        self.bal |= other.bal;
+    }
+}
+
+/// The EL peer cache. In-memory maps are authoritative; [`flush`](Self::flush)
+/// rewrites the whole file (truncating). A cache with no path (`disabled`)
+/// accepts all mutations as no-ops — the pool can hold one unconditionally.
+pub struct ElPeerCache {
+    path: Option<PathBuf>,
+    /// `ip\tport` → entry. `BTreeMap` for deterministic rewrite order (line
+    /// order doesn't affect compatibility — parsing is order-independent).
+    entries: BTreeMap<String, Entry>,
+    /// Consecutive-failure streaks — in-memory only (Java parity: the streak is
+    /// not persisted; only the resulting DENIED verdict is).
+    failures: HashMap<String, u32>,
+    dirty: bool,
+}
+
+impl ElPeerCache {
+    /// A cache with no backing file: loads nothing, persists nothing.
+    pub fn disabled() -> ElPeerCache {
+        ElPeerCache {
+            path: None,
+            entries: BTreeMap::new(),
+            failures: HashMap::new(),
+            dirty: false,
+        }
+    }
+
+    /// Load the cache at `path` (missing file → empty). Malformed lines are
+    /// skipped, never fatal.
+    pub fn load(path: PathBuf) -> ElPeerCache {
+        let mut cache = ElPeerCache {
+            path: Some(path.clone()),
+            entries: BTreeMap::new(),
+            failures: HashMap::new(),
+            dirty: false,
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            return cache; // missing/unreadable → empty
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            cache.parse_line(line);
+        }
+        cache
+    }
+
+    /// Parse one cache line into `entries` (tab format, or the legacy colon
+    /// format as a fallback). Silently skips a line it can't understand.
+    fn parse_line(&mut self, line: &str) {
+        let parts: Vec<&str> = line.split(SEP_CH).collect();
+        if parts.len() < 3 {
+            self.parse_legacy_line(line);
+            return;
+        }
+        // The key goes through `key`, which canonicalizes the PARSED IP (not
+        // the literal: uppercase/expanded IPv6, or the v4-mapped `::ffff:` form
+        // of a v4 peer) so it matches what `addr_key` computes on a later
+        // mutate — otherwise quality updates would miss and `add` would
+        // duplicate the entry. An unparseable IP drops the line.
+        let Ok(ip) = parts[0].parse::<IpAddr>() else {
+            return;
+        };
+        let Ok(port) = parts[1].parse::<u16>() else {
+            return;
+        };
+        let pubkey_hex = parts[2];
+        if parse_pubkey(pubkey_hex).is_none() {
+            return; // unusable node id → drop the line
+        }
+        let snap = parts.get(3).map_or(false, |f| *f == "1");
+        let mut quality = SnapQuality::Unknown;
+        let mut fails = 0u32;
+        let mut bal = false;
+        for token in &parts[4.min(parts.len())..] {
+            match *token {
+                "snapok" => quality = SnapQuality::Confirmed,
+                "snapbad" => quality = SnapQuality::Denied,
+                "bal" => bal = true,
+                t => {
+                    if let Some(n) = t.strip_prefix("fails=") {
+                        // Unreadable count → streak starts over at 0 (Java parity).
+                        fails = n.parse().unwrap_or(0);
+                    }
+                }
+            }
+        }
+        self.insert_loaded(
+            key(ip, port),
+            Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality, fails, bal },
+        );
+    }
+
+    /// Parse a legacy colon line `ip:port:pubkeyHex[:{0|1}]` (IPv4 only — the
+    /// legacy writer used colons, so v6 literals were never representable).
+    fn parse_legacy_line(&mut self, line: &str) {
+        let Some(first) = line.find(':') else { return };
+        let Some(second_rel) = line[first + 1..].find(':') else { return };
+        let second = first + 1 + second_rel;
+        let Ok(ip) = line[..first].parse::<IpAddr>() else {
+            return;
+        };
+        let Ok(port) = line[first + 1..second].parse::<u16>() else {
+            return;
+        };
+        let rest = &line[second + 1..];
+        let (pubkey_hex, snap) = match rest.rfind(':') {
+            Some(colon) if matches!(&rest[colon + 1..], "0" | "1") => {
+                (&rest[..colon], &rest[colon + 1..] == "1")
+            }
+            _ => (rest, false),
+        };
+        if pubkey_hex.is_empty() || pubkey_hex.contains(':') || parse_pubkey(pubkey_hex).is_none() {
+            return;
+        }
+        self.insert_loaded(
+            key(ip, port),
+            Entry {
+                pubkey_hex: pubkey_hex.to_string(),
+                snap,
+                quality: SnapQuality::Unknown,
+                fails: 0,
+                bal: false,
+            },
+        );
+    }
+
+    /// Insert a line parsed from disk. Two lines land on one key when the file
+    /// holds both spellings of a node (see the module doc — written while the
+    /// keys were split). For the same node id their verdicts are folded
+    /// together ([`Entry::absorb`]); this applies to any two lines of one node
+    /// id, an exact-duplicate spelling (a corrupt file) included, where the
+    /// later line used to win outright. A different node id at the same
+    /// endpoint is a re-keyed node, not a second spelling: the later line in
+    /// the file replaces the earlier one (verdicts are not folded across
+    /// identities), as a duplicate key always did. File order is key order
+    /// (`::ffff:` sorts after the plain spelling), not recency, so the id that
+    /// survives can be the stale one — the first successful handshake under
+    /// the live id sets it right ([`add`](Self::add)). Either way the cache is
+    /// marked dirty, so the next flush writes the node once.
+    fn insert_loaded(&mut self, k: String, loaded: Entry) {
+        match self.entries.get_mut(&k) {
+            Some(e) if parse_pubkey(&e.pubkey_hex) == parse_pubkey(&loaded.pubkey_hex) => {
+                e.absorb(loaded);
+                self.dirty = true;
+            }
+            _ => {
+                if self.entries.insert(k, loaded).is_some() {
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// All cached peers, snap-serving quality first (Confirmed → Unknown →
+    /// Denied), then non-snap; within a rank, the peers that served a verified
+    /// BAL first. Entries whose stored address/pubkey no longer parse are
+    /// skipped.
+    pub fn peers(&self) -> Vec<CachedElPeer> {
+        let mut out: Vec<(CachedElPeer, bool)> = self
+            .entries
+            .iter()
+            .filter_map(|(k, e)| {
+                let addr = parse_key(k)?;
+                let pubkey = parse_pubkey(&e.pubkey_hex)?;
+                // A peer past the connect-failure demote threshold reports
+                // Denied regardless of its learned serve quality: a
+                // currently-unreachable Confirmed peer must not outrank
+                // reachable candidates in the dial order. The stored verdict
+                // is kept — one successful connect clears the streak and
+                // restores it (Java parity).
+                let quality = if e.fails >= CONNECT_FAILURE_DEMOTE {
+                    SnapQuality::Denied
+                } else {
+                    e.quality
+                };
+                Some((CachedElPeer { addr, pubkey, snap: e.snap, quality }, e.bal))
+            })
+            .collect();
+        // Snap peers first (by quality), then non-snap; BAL servers first
+        // within a rank. Stable otherwise.
+        out.sort_by_key(|(p, bal)| (if p.snap { p.quality.dial_rank() } else { 3 }, !*bal));
+        out.into_iter().map(|(p, _)| p).collect()
+    }
+
+    /// Whether the peer at `addr` served a verified BAL (the `bal` token).
+    pub fn is_bal_server(&self, addr: SocketAddr) -> bool {
+        self.entries.get(&addr_key(addr)).is_some_and(|e| e.bal)
+    }
+
+    /// Drop the BAL mark of the peer at `addr`: it was caught forging one, or
+    /// its session no longer speaks a BAL protocol.
+    pub fn record_bal_lost(&mut self, addr: SocketAddr) {
+        if let Some(e) = self.entries.get_mut(&addr_key(addr)) {
+            if e.bal {
+                e.bal = false;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Mark the peer at `addr` as one that served a verified block access
+    /// list (#691). A peer not in the cache is not added: only an admitted
+    /// peer is ever asked, and admission adds it.
+    pub fn record_bal_served(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        if let Some(e) = self.entries.get_mut(&addr_key(addr)) {
+            if !e.bal {
+                e.bal = true;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// How many cached peers are snap servers [`peers`](Self::peers) would not
+    /// report as denied — the Tor reserve's share is taken of these — counted
+    /// without building the list.
+    pub(crate) fn verified_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.snap && e.quality != SnapQuality::Denied && e.fails < CONNECT_FAILURE_DEMOTE)
+            .count()
+    }
+
+    /// The file this cache persists to (`None` when disabled).
+    pub(crate) fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// Take the peer at `addr` out of the cache (it moves to the Tor reserve,
+    /// `el::torreserve`), as [`peers`](Self::peers) would report it but with
+    /// its stored verdict.
+    pub(crate) fn remove(&mut self, addr: SocketAddr) -> Option<CachedElPeer> {
+        let k = addr_key(addr);
+        let e = self.entries.remove(&k)?;
+        self.failures.remove(&k);
+        self.dirty = true;
+        Some(CachedElPeer { addr, pubkey: parse_pubkey(&e.pubkey_hex)?, snap: e.snap, quality: e.quality })
+    }
+
+    /// Put back a peer the Tor reserve released, keeping its verdict; its
+    /// connect-failure streak starts over (it was reachable when it moved
+    /// out, and the reserve's failures were Tor's).
+    pub(crate) fn restore(&mut self, peer: &CachedElPeer) {
+        if self.path.is_none() {
+            return;
+        }
+        let k = addr_key(peer.addr);
+        self.failures.remove(&k);
+        self.entries.insert(
+            k,
+            Entry { pubkey_hex: pubkey_hex(&peer.pubkey), snap: peer.snap, quality: peer.quality, fails: 0, bal: false },
+        );
+        self.dirty = true;
+    }
+
+    /// The STORED snap verdict on one cached peer, or `None` when the address
+    /// is not cached. Deliberately without the connect-failure demotion
+    /// [`peers`](Self::peers) applies: that demotion orders DIALS by recent
+    /// reachability, whereas the pool reads this at admission — the peer just
+    /// connected — to ask whether it once proved itself, which is what the
+    /// read ladder ranks on.
+    pub fn quality_of(&self, addr: SocketAddr) -> Option<SnapQuality> {
+        self.entries.get(&addr_key(addr)).map(|e| e.quality)
+    }
+
+    /// Record a peer that reached a READY session with capability `snap`. New
+    /// peers enter as [`SnapQuality::Unknown`]; a re-add only updates the snap
+    /// flag (quality is driven by the serve/failure signals). A DIFFERENT node
+    /// id at a cached endpoint — the handshake just authenticated it — is a
+    /// re-keyed node: the entry is replaced, verdicts included, since they were
+    /// earned by the previous identity (the rule `insert_loaded` applies to a
+    /// file). Without this a stale id would sit on the key for good: a dial
+    /// with it fails ECIES, and a success under the live id used to clear the
+    /// streak without touching the id, so the entry neither healed nor reached
+    /// eviction.
+    pub fn add(&mut self, addr: SocketAddr, pubkey: &[u8; 64], snap: bool) {
+        if self.path.is_none() {
+            return;
+        }
+        let k = addr_key(addr);
+        match self.entries.get_mut(&k) {
+            Some(e) if parse_pubkey(&e.pubkey_hex) == Some(*pubkey) => {
+                if e.snap != snap {
+                    e.snap = snap;
+                    self.dirty = true;
+                }
+                // Reachable again — clear the connect-failure streak. A cleared
+                // PERSISTED streak must dirty the cache: a memory-only reset
+                // would be resurrected on restart and re-demote a reachable
+                // peer (Java parity).
+                if e.fails != 0 {
+                    e.fails = 0;
+                    self.dirty = true;
+                }
+            }
+            _ => {
+                // New endpoint, or a re-keyed one: a fresh entry either way
+                // (and no snap-failure streak carried over from the old id).
+                self.failures.remove(&k);
+                self.entries.insert(
+                    k,
+                    Entry {
+                        pubkey_hex: pubkey_hex(pubkey),
+                        snap,
+                        quality: SnapQuality::Unknown,
+                        fails: 0,
+                        bal: false,
+                    },
+                );
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// A dial to this peer completed a session without snap — still proof the
+    /// address is alive, so clear its connect-failure streak (persisted lazily).
+    pub fn record_connect_success(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        if let Some(e) = self.entries.get_mut(&addr_key(addr)) {
+            // Dirty on a real clear so a persisted fails=N can't be
+            // resurrected by the next restart.
+            if e.fails != 0 {
+                e.fails = 0;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// A TCP-level dial failure (refused/timeout/unreachable) against a cached
+    /// peer. No-op for unknown addresses. Crossing [`CONNECT_FAILURE_DEMOTE`]
+    /// persists the streak and demotes the peer's reported quality; crossing
+    /// [`CONNECT_FAILURE_EVICT`] evicts it — callers must only report while
+    /// demonstrably online (e.g. some other pooled peer is live), so an offline
+    /// device can't decimate its own cache.
+    pub fn record_connect_failure(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        let k = addr_key(addr);
+        let Some(e) = self.entries.get_mut(&k) else {
+            return;
+        };
+        e.fails = e.fails.saturating_add(1);
+        if e.fails >= CONNECT_FAILURE_EVICT {
+            let fails = e.fails;
+            self.entries.remove(&k);
+            self.failures.remove(&k);
+            self.dirty = true;
+            tracing::info!(%addr, fails, "evicted unreachable peer from EL cache");
+        } else if e.fails % CONNECT_FAILURE_DEMOTE == 0 {
+            // Persist every 5th failure (not just the demote crossing) so a
+            // restart resumes the streak with at most 4 counts lost — keeping
+            // eviction genuinely cumulative across restarts (Java parity).
+            self.dirty = true;
+            if e.fails == CONNECT_FAILURE_DEMOTE {
+                tracing::info!(%addr, fails = e.fails, "deprioritized unreachable EL cache peer");
+            }
+        }
+    }
+
+    /// A snap fetch against this peer returned usable proof material: mark it
+    /// CONFIRMED (dial-first on restart) and clear its failure streak.
+    pub fn record_snap_served(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        let k = addr_key(addr);
+        self.failures.remove(&k);
+        if let Some(e) = self.entries.get_mut(&k) {
+            // Dirty on a real clear so a persisted fails=N can't be
+            // resurrected by the next restart.
+            if e.fails != 0 {
+                e.fails = 0;
+                self.dirty = true;
+            }
+            if e.quality != SnapQuality::Confirmed {
+                e.quality = SnapQuality::Confirmed;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// A snap fetch failed (timeout / empty / bad proof). After
+    /// [`FAILURE_THRESHOLD`] consecutive failures with no intervening serve, the
+    /// peer is marked DENIED (deprioritized, not evicted).
+    pub fn record_snap_failure(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        let k = addr_key(addr);
+        // Java parity (`if (!entries.containsKey(key)) return;`): only track
+        // failures for peers we actually cached, so the streak map can't grow
+        // for never-added addresses.
+        if !self.entries.contains_key(&k) {
+            return;
+        }
+        let count = self.failures.entry(k.clone()).or_insert(0);
+        *count += 1;
+        if *count >= FAILURE_THRESHOLD {
+            if let Some(e) = self.entries.get_mut(&k) {
+                if e.quality != SnapQuality::Denied {
+                    e.quality = SnapQuality::Denied;
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Rewrite the file from the in-memory state (truncating) if anything
+    /// changed since the last flush. Best-effort: a write error is dropped
+    /// (persistence must never take the engine down).
+    pub fn flush(&mut self) {
+        let Some(path) = &self.path else { return };
+        if !self.dirty {
+            return;
+        }
+        let mut body = String::with_capacity(self.entries.len() * 96);
+        for (k, e) in &self.entries {
+            body.push_str(k); // ip\tport
+            body.push(SEP_CH);
+            body.push_str(&e.pubkey_hex);
+            body.push(SEP_CH);
+            body.push(if e.snap { '1' } else { '0' });
+            match e.quality {
+                SnapQuality::Confirmed => {
+                    body.push(SEP_CH);
+                    body.push_str("snapok");
+                }
+                SnapQuality::Denied => {
+                    body.push(SEP_CH);
+                    body.push_str("snapbad");
+                }
+                SnapQuality::Unknown => {}
+            }
+            if e.fails > 0 {
+                body.push(SEP_CH);
+                body.push_str(&format!("fails={}", e.fails));
+            }
+            if e.bal {
+                body.push(SEP_CH);
+                body.push_str("bal");
+            }
+            body.push('\n');
+        }
+        if fs::write(path, body).is_ok() {
+            self.dirty = false;
+        }
+    }
+
+    /// Count of cached entries (for host status / tests).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+const SEP_CH: char = '\t';
+
+/// `ip\tport` key — THE one key derivation: the parse path calls it with the
+/// IP it parsed, the mutate path through [`addr_key`]. The IP is canonicalized:
+/// an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) keys as the plain v4, so a
+/// node discv4 hands the pool under both spellings holds one entry. The
+/// rendered IP reads back through [`parse_key`] unchanged.
+pub(crate) fn key(ip: IpAddr, port: u16) -> String {
+    format!("{}{SEP_CH}{port}", ip.to_canonical())
+}
+
+/// `ip\tport` key from a socket address (the mutate path): [`key`] on its parts.
+pub(crate) fn addr_key(addr: SocketAddr) -> String {
+    key(addr.ip(), addr.port())
+}
+
+/// Recover a socket address from an `ip\tport` key. `None` if either side is
+/// unparseable (a corrupt entry is skipped rather than crashing).
+pub(crate) fn parse_key(k: &str) -> Option<SocketAddr> {
+    let (ip, port) = k.split_once(SEP_CH)?;
+    let ip: std::net::IpAddr = ip.parse().ok()?;
+    let port: u16 = port.parse().ok()?;
+    Some(SocketAddr::new(ip, port))
+}
+
+/// A 64-byte node id as `0x`-prefixed lowercase hex (Java `Bytes.toHexString`).
+pub(crate) fn pubkey_hex(pubkey: &[u8; 64]) -> String {
+    let mut s = String::with_capacity(2 + 128);
+    s.push_str("0x");
+    for b in pubkey {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Parse a `0x`-prefixed-or-bare 128-hex node id into 64 bytes. Panic-free —
+/// `None` on any malformed input (cache files are semi-trusted on disk), and
+/// strictly hex: `u8::from_str_radix` alone would accept a `+f` pair. Shared
+/// with `reader::parse_enode`, the enode URL parser.
+pub(crate) fn parse_pubkey(hex: &str) -> Option<[u8; 64]> {
+    let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+    if hex.len() != 128 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pk(n: u8) -> [u8; 64] {
+        [n; 64]
+    }
+
+    #[test]
+    fn round_trips_through_the_file() {
+        let dir = std::env::temp_dir().join(format!("myotis-elcache-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("peers.cache");
+        let _ = fs::remove_file(&path);
+
+        let mut c = ElPeerCache::load(path.clone());
+        let a: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        let b: SocketAddr = "5.6.7.8:30304".parse().unwrap();
+        c.add(a, &pk(0x11), true);
+        c.add(b, &pk(0x22), false);
+        c.record_snap_served(a); // a → Confirmed
+        c.flush();
+
+        let reloaded = ElPeerCache::load(path.clone());
+        let peers = reloaded.peers();
+        assert_eq!(peers.len(), 2);
+        // Confirmed snap peer sorts first.
+        assert_eq!(peers[0].addr, a);
+        assert_eq!(peers[0].pubkey, pk(0x11));
+        assert!(peers[0].snap);
+        assert_eq!(peers[0].quality, SnapQuality::Confirmed);
+        // Non-snap peer sorts last.
+        assert_eq!(peers[1].addr, b);
+        assert!(!peers[1].snap);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quality_of_matches_what_peers_reports() {
+        let path = std::env::temp_dir()
+            .join(format!("myotis-peercache-quality-of-{}.cache", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut cache = ElPeerCache::load(path.clone());
+        let a: std::net::SocketAddr = "192.0.2.10:30303".parse().unwrap();
+        let b: std::net::SocketAddr = "192.0.2.11:30303".parse().unwrap();
+        assert_eq!(cache.quality_of(a), None);
+        cache.add(a, &[1u8; 64], true);
+        cache.add(b, &[2u8; 64], true);
+        cache.record_snap_served(a);
+        assert_eq!(cache.quality_of(a), Some(SnapQuality::Confirmed));
+        assert_eq!(cache.quality_of(b), Some(SnapQuality::Unknown));
+        for p in cache.peers() {
+            assert_eq!(cache.quality_of(p.addr), Some(p.quality));
+        }
+        // A connect-failure streak demotes the DIAL order (`peers()`), not the
+        // stored verdict: a proven server that was unreachable for a while
+        // and just connected is still a proven server.
+        for _ in 0..CONNECT_FAILURE_DEMOTE {
+            cache.record_connect_failure(a);
+        }
+        assert_eq!(cache.peers().iter().find(|p| p.addr == a).unwrap().quality, SnapQuality::Denied);
+        assert_eq!(cache.quality_of(a), Some(SnapQuality::Confirmed));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn denies_after_three_failures_and_reconfirms_on_serve() {
+        let mut c = ElPeerCache::load(std::env::temp_dir().join("myotis-elcache-deny.cache"));
+        let a: SocketAddr = "9.9.9.9:30303".parse().unwrap();
+        c.add(a, &pk(1), true);
+        c.record_snap_failure(a);
+        c.record_snap_failure(a);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Unknown); // < threshold
+        c.record_snap_failure(a);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied); // 3rd → denied
+        c.record_snap_served(a);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed); // serve reconfirms
+    }
+
+    #[test]
+    fn a_bal_server_survives_a_reload_and_is_dialed_first_within_its_rank() {
+        let path = std::env::temp_dir().join(format!("myotis-elcache-bal-{}.cache", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        let a: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        let b: SocketAddr = "1.2.3.5:30303".parse().unwrap();
+        c.add(a, &pk(1), true);
+        c.add(b, &pk(2), true);
+        c.record_bal_served(b);
+        // Not added by a mark: only an admitted peer is ever asked for a BAL.
+        c.record_bal_served("9.9.9.9:30303".parse().unwrap());
+        c.flush();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().filter(|l| l.ends_with("\tbal")).count(), 1, "{text}");
+        let reloaded = ElPeerCache::load(path.clone());
+        assert!(reloaded.is_bal_server(b) && !reloaded.is_bal_server(a));
+        assert_eq!(reloaded.len(), 2);
+        // Same rank (Unknown): the BAL server first.
+        assert_eq!(reloaded.peers()[0].addr, b);
+        // A Confirmed peer still outranks it: the mark orders within a rank only.
+        let mut c = reloaded;
+        c.record_snap_served(a);
+        assert_eq!(c.peers()[0].addr, a);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn connect_failures_demote_evict_and_reset() {
+        let path = std::env::temp_dir().join("myotis-elcache-connfail.cache");
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        let a: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        c.add(a, &pk(1), true);
+        c.record_snap_served(a); // Confirmed
+
+        // Below the demote threshold the learned verdict shows through.
+        for _ in 0..CONNECT_FAILURE_DEMOTE - 1 {
+            c.record_connect_failure(a);
+        }
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+        // Crossing it reports Denied — and persists.
+        c.record_connect_failure(a);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied);
+        c.flush();
+        let reloaded = ElPeerCache::load(path.clone());
+        assert_eq!(reloaded.peers()[0].quality, SnapQuality::Denied);
+
+        // A successful re-connect clears the streak and restores the verdict.
+        c.add(a, &pk(1), true);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+
+        // Sustained unreachability evicts.
+        for _ in 0..CONNECT_FAILURE_EVICT {
+            c.record_connect_failure(a);
+        }
+        assert!(c.is_empty());
+        // Unknown addresses never create entries.
+        c.record_connect_failure("9.9.9.9:1".parse().unwrap());
+        assert!(c.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clearing_a_persisted_streak_flushes_the_file() {
+        let hex = format!("0x{}", "ab".repeat(64));
+        let text = format!("1.2.3.4\t30303\t{hex}\t1\tsnapok\tfails=7\n");
+        let path = std::env::temp_dir().join("myotis-elcache-streakclear.cache");
+        fs::write(&path, text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied);
+
+        // The peer re-handshakes: the reset must reach the FILE, or the next
+        // restart resurrects fails=7 and re-demotes a reachable peer.
+        c.add("1.2.3.4:30303".parse().unwrap(), &[0xab; 64], true);
+        c.flush();
+        let reloaded = ElPeerCache::load(path.clone());
+        assert_eq!(reloaded.peers()[0].quality, SnapQuality::Confirmed);
+        assert!(!fs::read_to_string(&path).unwrap().contains("fails="));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_and_rewrites_fails_token() {
+        let hex = format!("0x{}", "ab".repeat(64));
+        // A streak resumed from disk: 4 = one below the demote threshold.
+        let text = format!("1.2.3.4\t30303\t{hex}\t1\tsnapok\tfails=4\n");
+        let path = std::env::temp_dir().join("myotis-elcache-failstok.cache");
+        fs::write(&path, text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        // Below the threshold the learned verdict still shows through.
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+        // One more failure crosses the demote threshold → persisted, and the
+        // stored snapok verdict is kept alongside the streak.
+        c.record_connect_failure("1.2.3.4:30303".parse().unwrap());
+        c.flush();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\tsnapok\tfails=5\n"), "got: {body}");
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_java_tab_format_including_quality_and_snap_flag() {
+        let hex = format!("0x{}", "ab".repeat(64));
+        let text = format!(
+            "1.2.3.4\t30303\t{hex}\t1\tsnapok\n\
+             5.6.7.8\t30304\t{hex}\t0\n\
+             9.9.9.9\t30305\t{hex}\t1\tsnapbad\n"
+        );
+        let path = std::env::temp_dir().join("myotis-elcache-java.cache");
+        fs::write(&path, text).unwrap();
+        let c = ElPeerCache::load(path.clone());
+        let peers = c.peers();
+        assert_eq!(peers.len(), 3);
+        // Confirmed first, then non-snap ranks last (after the denied snap peer).
+        assert_eq!(peers[0].quality, SnapQuality::Confirmed);
+        assert!(peers[0].snap);
+        assert_eq!(peers[1].quality, SnapQuality::Denied);
+        assert!(peers[1].snap);
+        assert!(!peers[2].snap);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migrates_legacy_colon_format() {
+        let hex = "cd".repeat(64); // bare, no 0x
+        let text = format!("1.2.3.4:30303:{hex}:1\n5.6.7.8:30304:{hex}\n");
+        let path = std::env::temp_dir().join("myotis-elcache-legacy.cache");
+        fs::write(&path, text).unwrap();
+        let c = ElPeerCache::load(path.clone());
+        let peers = c.peers();
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().any(|p| p.snap));
+        assert!(peers.iter().any(|p| !p.snap));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn skips_malformed_lines() {
+        let path = std::env::temp_dir().join("myotis-elcache-bad.cache");
+        fs::write(
+            &path,
+            "garbage\n1.2.3.4\tnotaport\t0xdead\n1.2.3.4\t30303\tnothex\n",
+        )
+        .unwrap();
+        let c = ElPeerCache::load(path.clone());
+        assert!(c.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disabled_cache_is_inert() {
+        let mut c = ElPeerCache::disabled();
+        c.add("1.2.3.4:30303".parse().unwrap(), &pk(1), true);
+        c.record_snap_served("1.2.3.4:30303".parse().unwrap());
+        c.flush();
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn non_canonical_ip_is_matched_after_canonicalization() {
+        // A non-canonical IPv6 literal in the file (uppercase + expanded) must
+        // load under the SAME key a later mutate computes, so quality updates
+        // land and `add` doesn't duplicate.
+        let hex = format!("0x{}", "ab".repeat(64));
+        let text = format!("2001:0DB8:0000:0000:0000:0000:0000:0001\t30303\t{hex}\t1\n");
+        let path = std::env::temp_dir().join("myotis-elcache-canon.cache");
+        fs::write(&path, text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        assert_eq!(c.len(), 1);
+        // The canonical form of that address.
+        let canonical: SocketAddr = "[2001:db8::1]:30303".parse().unwrap();
+        c.record_snap_served(canonical);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+        // Re-adding the canonical address must NOT create a duplicate.
+        c.add(canonical, &pk(0xab), true);
+        assert_eq!(c.len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v4_mapped_and_plain_spellings_share_one_entry() {
+        // discv4 can hand the pool one v4 node under two spellings: the plain
+        // address (a bonded sender) and the IPv4-mapped IPv6 form (a NEIGHBORS
+        // entry carrying a 16-byte IP). Both must land on ONE entry — one
+        // connect-failure streak, one verdict — and the file must carry the
+        // plain spelling only.
+        let path = std::env::temp_dir().join("myotis-elcache-v4mapped.cache");
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        let plain: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:1.2.3.4]:30303".parse().unwrap();
+        c.add(mapped, &pk(0xab), true);
+        c.add(plain, &pk(0xab), true);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.peers()[0].addr, plain);
+        // Verdicts recorded under either spelling land on that one entry.
+        c.record_snap_served(mapped);
+        assert_eq!(c.quality_of(plain), Some(SnapQuality::Confirmed));
+        for _ in 0..CONNECT_FAILURE_DEMOTE {
+            c.record_connect_failure(mapped);
+        }
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied);
+        c.record_connect_success(plain);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+        for _ in 0..FAILURE_THRESHOLD {
+            c.record_snap_failure(mapped);
+        }
+        assert_eq!(c.quality_of(plain), Some(SnapQuality::Denied));
+        c.flush();
+        let hex = format!("0x{}", "ab".repeat(64));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("1.2.3.4\t30303\t{hex}\t1\tsnapbad\n")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lone_v4_mapped_line_loads_under_the_plain_key() {
+        // A file holding only the `::ffff:` spelling of a node (what a Rust
+        // engine wrote while the keys were split, for a node it never reached
+        // as plain v4) loads under the plain key: `peers()` dials the plain
+        // address, verdicts recorded under either spelling land on it, and a
+        // later `add` of the plain form does not duplicate it.
+        let hex = format!("0x{}", "ab".repeat(64));
+        let path = std::env::temp_dir().join("myotis-elcache-lonemapped.cache");
+        fs::write(&path, format!("::ffff:1.2.3.4\t30303\t{hex}\t1\tsnapok\n")).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        let plain: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:1.2.3.4]:30303".parse().unwrap();
+        assert_eq!(c.peers()[0].addr, plain);
+        assert_eq!(c.quality_of(plain), Some(SnapQuality::Confirmed));
+        assert_eq!(c.quality_of(mapped), Some(SnapQuality::Confirmed));
+        c.add(plain, &pk(0xab), true);
+        assert_eq!(c.len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn absorb_folds_by_the_documented_lattice() {
+        // Pin the fold policy: snap if either; Confirmed over Denied over
+        // Unknown; the lower connect streak.
+        let entry = |snap: bool, quality: SnapQuality, fails: u32| Entry {
+            pubkey_hex: pubkey_hex(&pk(1)),
+            snap,
+            quality,
+            fails,
+            bal: false,
+        };
+        let fold = |a: Entry, b: Entry| {
+            let mut a = a;
+            a.absorb(b);
+            (a.snap, a.quality, a.fails)
+        };
+        use SnapQuality::{Confirmed, Denied, Unknown};
+        assert_eq!(fold(entry(false, Unknown, 0), entry(true, Unknown, 0)), (true, Unknown, 0));
+        assert_eq!(fold(entry(true, Confirmed, 7), entry(true, Denied, 2)), (true, Confirmed, 2));
+        assert_eq!(fold(entry(true, Denied, 0), entry(true, Confirmed, 9)), (true, Confirmed, 0));
+        assert_eq!(fold(entry(true, Denied, 3), entry(false, Unknown, 1)), (true, Denied, 1));
+        assert_eq!(fold(entry(true, Unknown, 4), entry(true, Denied, 50)), (true, Denied, 4));
+    }
+
+    #[test]
+    fn add_replaces_a_re_keyed_node() {
+        // A successful handshake that authenticates a DIFFERENT node id at a
+        // cached endpoint replaces the entry, verdicts included — the old id
+        // can never handshake again, and its verdicts were its own.
+        let path = std::env::temp_dir().join("myotis-elcache-rekey-add.cache");
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        let a: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        c.add(a, &pk(0xab), true);
+        c.record_snap_served(a);
+        c.record_snap_failure(a); // a streak in flight under the old id
+        for _ in 0..CONNECT_FAILURE_DEMOTE {
+            c.record_connect_failure(a);
+        }
+        c.add(a, &pk(0xcd), false);
+        assert_eq!(c.len(), 1);
+        let p = &c.peers()[0];
+        assert_eq!(p.pubkey, pk(0xcd));
+        assert!(!p.snap);
+        assert_eq!(p.quality, SnapQuality::Unknown);
+        // The old id's snap-failure streak did not carry over: two failures
+        // under the new id are still below the threshold.
+        c.record_snap_failure(a);
+        c.record_snap_failure(a);
+        assert_eq!(c.quality_of(a), Some(SnapQuality::Unknown));
+        c.flush();
+        let hex_cd = format!("0x{}", "cd".repeat(64));
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("1.2.3.4\t30303\t{hex_cd}\t0\n"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_folds_both_spellings_of_one_node_into_one_entry() {
+        // A cache written while the keys were split (the dev Mac's
+        // peers-sepolia.cache, 2026-10-07) holds one node twice, each line with
+        // its own streak and verdict. It loads as one entry — snap if either
+        // line says so, Confirmed over Denied over Unknown, the lower streak —
+        // and the very next flush writes the node once, under the plain
+        // spelling, which also heals the Java engine's view of the shared file.
+        let hex = format!("0x{}", "ab".repeat(64));
+        let text = format!(
+            "15.235.51.214\t30303\t{hex}\t1\tsnapok\tfails=7\n\
+             ::ffff:15.235.51.214\t30303\t{hex}\t0\tfails=2\n"
+        );
+        let path = std::env::temp_dir().join("myotis-elcache-fold.cache");
+        fs::write(&path, &text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        assert_eq!(c.len(), 1);
+        let peers = c.peers();
+        assert_eq!(peers[0].addr, "15.235.51.214:30303".parse::<SocketAddr>().unwrap());
+        assert!(peers[0].snap);
+        assert_eq!(peers[0].quality, SnapQuality::Confirmed); // fails=2 < demote
+        c.flush();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("15.235.51.214\t30303\t{hex}\t1\tsnapok\tfails=2\n")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_keeps_the_later_line_when_the_node_id_differs() {
+        // A different node id at the same endpoint is a re-keyed node, not a
+        // second spelling: the later line in the file replaces the earlier one
+        // outright (verdicts are not folded across identities), the dropped
+        // line leaves the file on the next flush, and — since file order is
+        // key order, not recency — the first handshake under the live id sets
+        // the id right whichever line won.
+        let hex_a = format!("0x{}", "ab".repeat(64));
+        let hex_b = format!("0x{}", "cd".repeat(64));
+        let text =
+            format!("1.2.3.4\t30303\t{hex_a}\t1\tsnapok\n::ffff:1.2.3.4\t30303\t{hex_b}\t0\n");
+        let path = std::env::temp_dir().join("myotis-elcache-rekeyed.cache");
+        fs::write(&path, text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        assert_eq!(c.len(), 1);
+        let p = &c.peers()[0];
+        assert_eq!(p.pubkey, pk(0xcd));
+        assert!(!p.snap);
+        assert_eq!(p.quality, SnapQuality::Unknown);
+        c.flush();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("1.2.3.4\t30303\t{hex_b}\t0\n"));
+        // The live node turns out to be the one the earlier line named.
+        c.add("1.2.3.4:30303".parse().unwrap(), &pk(0xab), true);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.peers()[0].pubkey, pk(0xab));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failure_for_unknown_peer_is_ignored() {
+        // Java parity: recording a failure for a peer that was never added is a
+        // no-op (doesn't create an untracked streak entry).
+        let mut c = ElPeerCache::load(std::env::temp_dir().join("myotis-elcache-unknown.cache"));
+        c.record_snap_failure("7.7.7.7:30303".parse().unwrap());
+        c.record_snap_failure("7.7.7.7:30303".parse().unwrap());
+        c.record_snap_failure("7.7.7.7:30303".parse().unwrap());
+        assert!(c.is_empty());
+        // Adding it now starts a fresh streak — one failure must NOT deny it.
+        let a: SocketAddr = "7.7.7.7:30303".parse().unwrap();
+        c.add(a, &pk(1), true);
+        c.record_snap_failure(a);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Unknown);
+    }
+
+    #[test]
+    fn written_bytes_match_the_java_line_format() {
+        // Pin the exact on-disk bytes so cross-engine (Java <-> Rust) sharing
+        // can't silently regress: `ip\tport\t0x<128hex>\t{1|0}[\tsnapok|snapbad]`.
+        let path = std::env::temp_dir().join("myotis-elcache-bytes.cache");
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        c.add("1.2.3.4:30303".parse().unwrap(), &pk(0xab), true);
+        c.record_snap_served("1.2.3.4:30303".parse().unwrap());
+        c.add("5.6.7.8:30304".parse().unwrap(), &pk(0xcd), false);
+        c.flush();
+        let written = fs::read_to_string(&path).unwrap();
+        let hex_ab = format!("0x{}", "ab".repeat(64));
+        let hex_cd = format!("0x{}", "cd".repeat(64));
+        // BTreeMap order: "1.2.3.4\t30303" < "5.6.7.8\t30304".
+        assert_eq!(
+            written,
+            format!("1.2.3.4\t30303\t{hex_ab}\t1\tsnapok\n5.6.7.8\t30304\t{hex_cd}\t0\n")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pubkey_hex_round_trip() {
+        let p = pk(0x5a);
+        assert_eq!(parse_pubkey(&pubkey_hex(&p)), Some(p));
+        assert_eq!(parse_pubkey(&"5a".repeat(64)), Some(p)); // bare accepted
+        assert!(parse_pubkey("0x1234").is_none());
+        assert!(parse_pubkey(&"zz".repeat(64)).is_none());
+    }
+}

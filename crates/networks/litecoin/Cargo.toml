@@ -1,0 +1,25 @@
+[package]
+name = "network-litecoin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wallet-core = { path = "../../wallet-core" }
+anyhow.workspace = true
+bitcoin.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+hex.workspace = true
+zeroize.workspace = true
+bech32 = "0.11"
+bs58 = { version = "0.5", features = ["check"] }
+scrypt = { version = "0.10", default-features = false }
+num-bigint = "0.4"
+num-traits = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile.workspace = true

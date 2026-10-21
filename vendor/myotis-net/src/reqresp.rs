@@ -1,0 +1,3117 @@
+//! libp2p transport + eth2 req/resp dialer/responder.
+//!
+//! Mirrors the behavior (not the structure) of the Java `BeaconP2PService`:
+//! TCP + noise XX + yamux or mplex with a secp256k1 identity (the CL spec
+//! requirement — see `build_swarm` for why BOTH muxers are offered),
+//! per-protocol req/resp streams where the dialer writes the request, half-closes,
+//! and buffers the response until the responder closes, and minimal responder
+//! roles for status/ping/metadata/goodbye (peers drop clients that don't answer
+//! those). The `light_client_*` read protocols answer `ResourceUnavailable` —
+//! the Java relays from a response cache when warm; empty-cache behavior is the
+//! same result code.
+//!
+//! Requests and responses cross this module as RAW WIRE BYTES ([`crate::codec`]
+//! frames); parsing/validation happens in the sync layer. An empty request means
+//! "write nothing, just half-close" (finality/optimistic — see `requestFinalityUpdate`).
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::prelude::*;
+use libp2p::identify;
+use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport};
+use libp2p::connection_limits::{self, ConnectionLimits};
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::{gossipsub, Multiaddr, PeerId, StreamProtocol, Swarm};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::codec;
+use crate::protocols;
+use crate::status::{self, StatusMessage};
+
+/// Response deadline mirroring the Java RESP_TIMEOUT (~10 s) for single-chunk
+/// protocols; updates_by_range gets the Java catch-up deadline (15 s) — live
+/// peers cap those responses at one chunk per request anyway (Lighthouse's
+/// one_every(10s) quota), so waiting longer buys nothing.
+pub const RESP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Live servers PACE multi-chunk responses (observed: single chunks arriving
+/// ~10 s apart under Lighthouse's rate limiter) — a short deadline turns a
+/// multi-chunk response into a 1-chunk one. This is the libp2p behaviour-level
+/// deadline: when IT fires, everything the codec buffered is dropped and the
+/// peer is charged a failure. A full 128-update batch cannot fit here for a
+/// paced or slow-link server, which is why the codec completes the read at
+/// UPDATES_READ_BUDGET with whatever whole chunks arrived — this timeout only
+/// fires when a peer sent NOTHING for the whole window. Sized so the budget
+/// below can cover a full 128-chunk batch (~3.5 MiB) on a ~65 KB/s link; the
+/// extra 15 s over the old 45 s only lengthens rounds where NO peer serves.
+pub const UPDATES_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total read budget for an updates_by_range response, deliberately under
+/// UPDATES_TIMEOUT: when it expires with data buffered, the read completes and
+/// the complete chunks are used (a paced ~10 s/chunk server yields ~5 periods
+/// per round instead of a behaviour timeout that loses all of them AND
+/// strike-marks the serving peer toward cache eviction). The clock starts at
+/// request time, NOT at the first byte — it shadows the behaviour timeout,
+/// so server think time before the first chunk spends the same budget.
+const UPDATES_READ_BUDGET: Duration = Duration::from_secs(55);
+
+/// Complete a response once the stream has gone quiet for this long with data
+/// buffered — the Rust twin of the Java controller's safety/drain timers.
+/// Responders SHOULD close after the last chunk, but some stall the close;
+/// waiting only for EOF would burn the whole request timeout instead.
+const RESPONSE_QUIET_WINDOW: Duration = Duration::from_secs(3);
+/// Multi-chunk (updates_by_range) quiet window: healthy responders stream
+/// chunks back-to-back; observed live behavior is one chunk per request from
+/// rate-limited peers, where waiting longer buys nothing — the sync loop
+/// rotates peers instead.
+/// Must comfortably exceed the observed inter-chunk pacing (~10 s) or the
+/// quiet window truncates paced batches to their first chunk.
+const UPDATES_QUIET_WINDOW: Duration = Duration::from_secs(12);
+
+/// Ceiling on response bytes queued but not yet written, across ALL inbound
+/// connections.
+///
+/// Per-request bounds (`MAX_REQUEST_LIGHT_CLIENT_UPDATES`, response byte caps)
+/// say nothing about how many responses can be in flight at once, and the two
+/// are very different numbers on a public responder: a full updates_by_range
+/// body is ~3.4 MiB built from a 16-byte request, held until written or until
+/// UPDATES_TIMEOUT (60 s) expires. One peer opening its permitted connections,
+/// filling its concurrent streams and then not reading would otherwise pin
+/// hundreds of MiB for a minute at a cost to itself of a couple of KiB.
+///
+/// Over budget we answer ResourceUnavailable, which is already the correct
+/// "ask someone else" answer and costs the caller nothing to retry.
+const MAX_IN_FLIGHT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Concurrent inbound streams per connection for `updates_by_range` when
+/// serving. A wallet catching up needs one at a time; 64 (the default for the
+/// cheap protocols) only multiplies the in-flight ceiling above.
+const SERVING_UPDATES_MAX_STREAMS: usize = 4;
+
+const MAX_REQUEST_WIRE_BYTES: usize = 1024;
+/// The root-list requests (`protocols::is_root_list_request`) are bigger than
+/// the fixed ones: up to `MAX_REQUEST_BLOCKS` (1024) roots = 32 KiB of SSZ
+/// for `blocks_by_root`, and up to 128 `DataColumnsByRootIdentifier`s of a
+/// root plus up to 128 column indices ≈ 140 KiB for the sidecar one, before
+/// framing. The answer is always empty, but a request we refuse to READ is a
+/// broken stream to the asker, which is exactly the failure these protocols
+/// are served to avoid. So the list is DRAINED up to this cap, never
+/// buffered (`read_request`): a stream costs nothing while it is read, and
+/// the per-connection stream cap stays at the default — libp2p DROPS an
+/// inbound stream beyond that cap ("at capacity"), which to the asker is the
+/// broken stream again.
+const MAX_ROOT_LIST_REQUEST_WIRE_BYTES: usize = 256 * 1024;
+/// A full 128-update batch is ~3.5 MiB on the wire (~128 x ~60 KB SSZ
+/// uncompressed). 16 MiB is a generous DoS ceiling, not a target.
+const MAX_RESPONSE_WIRE_BYTES: usize = 16 * 1024 * 1024;
+
+// -------------------------------------------------------------------------
+// Codec: raw wire bytes in, raw wire bytes out
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Eth2Protocol(pub StreamProtocol);
+
+impl AsRef<str> for Eth2Protocol {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct Eth2Codec;
+
+async fn read_capped<T>(io: &mut T, cap: usize) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut buf = Vec::new();
+    io.take(cap as u64 + 1).read_to_end(&mut buf).await?;
+    if buf.len() > cap {
+        // Requests and responses both come through here (read_request /
+        // read_response), so the message names neither.
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "stream exceeds size cap"));
+    }
+    Ok(buf)
+}
+
+/// Read to EOF and throw the bytes away, failing past `cap` exactly like
+/// [`read_capped`] — for a request whose answer never depends on its body.
+async fn drain_capped<T>(io: &mut T, cap: usize) -> io::Result<()>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let n = futures::io::copy(io.take(cap as u64 + 1), &mut futures::io::sink()).await?;
+    if n > cap as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "stream exceeds size cap"));
+    }
+    Ok(())
+}
+
+/// Read to EOF, but once at least one byte is buffered treat `quiet` of
+/// silence as end-of-response; also salvage buffered data when the peer
+/// resets the stream instead of half-closing. `budget`, when set, bounds the
+/// TOTAL read time measured from entry (mirroring the behaviour timeout it
+/// runs under — pre-first-byte server think time spends it too): when it
+/// expires with data buffered, the read completes with what arrived instead
+/// of running into the behaviour-level request timeout, which would discard
+/// the buffer and charge the peer a failure. With nothing buffered the read
+/// keeps waiting — a wholly unresponsive peer is left to the behaviour
+/// timeout, which is the failure signal eviction accounting keys off.
+async fn read_until_quiet<T>(
+    io: &mut T,
+    cap: usize,
+    quiet: Duration,
+    budget: Option<Duration>,
+) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let deadline = budget.map(|b| tokio::time::Instant::now() + b);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        // The quiet window only means anything once bytes are buffered (it
+        // detects "peer finished a paced response without closing"). Before the
+        // first byte, await the read with NO per-iteration timer — the
+        // behaviour-level request timeout is the deadline — instead of respawning
+        // a `quiet`-length timer every window while a slow peer spins up.
+        let read = if buf.is_empty() {
+            io.read(&mut chunk).await.map(Some)
+        } else {
+            let mut wake_at = tokio::time::Instant::now() + quiet;
+            if let Some(d) = deadline {
+                wake_at = wake_at.min(d);
+            }
+            match tokio::time::timeout_at(wake_at, io.read(&mut chunk)).await {
+                Ok(r) => r.map(Some),
+                // Quiet with data buffered — or total budget spent — → complete.
+                Err(_elapsed) => Ok(None),
+            }
+        };
+        match read {
+            Ok(Some(0)) => break,
+            Ok(Some(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > cap {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "response exceeds size cap",
+                    ));
+                }
+            }
+            Ok(None) => break, // quiet window elapsed with data buffered
+            Err(e) => {
+                if buf.is_empty() {
+                    return Err(e);
+                }
+                tracing::debug!(buffered = buf.len(), error = %e,
+                    "stream errored after data — salvaging buffered response");
+                break;
+            }
+        }
+    }
+    Ok(buf)
+}
+
+#[async_trait]
+impl request_response::Codec for Eth2Codec {
+    type Protocol = Eth2Protocol;
+    type Request = Vec<u8>;
+    type Response = Vec<u8>;
+
+    async fn read_request<T>(&mut self, p: &Eth2Protocol, io: &mut T) -> io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        // The requester half-closes after writing, so EOF delimits the request.
+        if protocols::is_root_list_request(p.as_ref()) {
+            // Never read by the responder (`respond_inbound` answers zero
+            // chunks whatever the list says), so drained, not buffered.
+            drain_capped(io, MAX_ROOT_LIST_REQUEST_WIRE_BYTES).await?;
+            return Ok(Vec::new());
+        }
+        read_capped(io, MAX_REQUEST_WIRE_BYTES).await
+    }
+
+    async fn read_response<T>(&mut self, p: &Eth2Protocol, io: &mut T) -> io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        // eth2 responders write their chunk(s) then close. Buffer until EOF,
+        // completing early when the stream goes quiet with data on hand —
+        // mirroring the Java controller's drain timers (and salvaging complete
+        // chunks when a peer resets instead of closing; the codec validates
+        // everything downstream).
+        let (quiet, budget) = if p.as_ref() == protocols::UPDATES_BY_RANGE {
+            // Budgeted: a full 128-update batch from a paced or slow-link
+            // server can outlast UPDATES_TIMEOUT; completing at the budget
+            // keeps the chunks that DID arrive (single-chunk protocols fit
+            // their behaviour timeout trivially and need no budget).
+            (UPDATES_QUIET_WINDOW, Some(UPDATES_READ_BUDGET))
+        } else {
+            (RESPONSE_QUIET_WINDOW, None)
+        };
+        read_until_quiet(io, MAX_RESPONSE_WIRE_BYTES, quiet, budget).await
+    }
+
+    async fn write_request<T>(&mut self, _p: &Eth2Protocol, io: &mut T, req: Vec<u8>) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        // Empty request = write NOTHING (finality/optimistic), then the handler
+        // half-closes — mirroring the Java doReqResp empty-payload path.
+        if !req.is_empty() {
+            io.write_all(&req).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_response<T>(&mut self, _p: &Eth2Protocol, io: &mut T, res: Vec<u8>) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&res).await
+    }
+}
+
+// -------------------------------------------------------------------------
+// Behaviour: one request_response instance per protocol (each eth2 protocol
+// negotiates independently; a single multi-protocol instance would offer every
+// protocol on every outbound stream)
+// -------------------------------------------------------------------------
+
+type RR = request_response::Behaviour<Eth2Codec>;
+
+fn rr(protocol: &'static str, support: ProtocolSupport, timeout: Duration) -> RR {
+    rr_with_streams(protocol, support, timeout, 64)
+}
+
+fn rr_with_streams(
+    protocol: &'static str,
+    support: ProtocolSupport,
+    timeout: Duration,
+    max_streams: usize,
+) -> RR {
+    request_response::Behaviour::with_codec(
+        Eth2Codec,
+        [(Eth2Protocol(StreamProtocol::new(protocol)), support)],
+        request_response::Config::default()
+            .with_request_timeout(timeout)
+            .with_max_concurrent_streams(max_streams),
+    )
+}
+
+#[derive(NetworkBehaviour)]
+pub struct Behaviour {
+    // Defense-in-depth: this client dials but also accepts inbound, and each
+    // protocol behaviour independently permits concurrent streams. Cap total
+    // established connections so a peer flood can't exhaust fds/memory.
+    pub limits: connection_limits::Behaviour,
+    pub identify: identify::Behaviour,
+    /// Gossipsub with NO subscriptions. It exists so the `/meshsub/` protocol
+    /// negotiates on every connection: Lighthouse (v8.1.3–v8.2.2 verified in
+    /// `lighthouse_network/src/service/mod.rs`) reports a peer whose gossipsub
+    /// upgrade fails with `PeerAction::Fatal` ("does_not_support_gossipsub"),
+    /// which bans the peer id for 12 h after ONE goodbye (reason 0) and bans
+    /// the whole IP once more than five of its peer ids are banned. A wallet
+    /// therefore got exactly one first-contact connection per Lighthouse
+    /// node per start, and the IP ban after a handful of restarts. Negotiating
+    /// the protocol is all the check needs; the mesh is never joined.
+    pub gossipsub: gossipsub::Behaviour,
+    pub status_v2: RR,
+    pub status_v1: RR,
+    pub ping: RR,
+    pub metadata: RR,
+    /// Fulu metadata. Post-Fulu peers ask for v3 — Nimbus for nothing else,
+    /// and it drops a peer that cannot answer (see `protocols::METADATA_V3`).
+    pub metadata_v3: RR,
+    pub goodbye: RR,
+    pub bootstrap: RR,
+    pub updates: RR,
+    pub finality: RR,
+    pub optimistic: RR,
+    /// Inbound only, always answered with zero chunks — see
+    /// `protocols::BLOCKS_BY_ROOT` for the Nimbus behaviour this placates.
+    pub blocks_by_root: RR,
+    /// Likewise — `protocols::DATA_COLUMN_SIDECARS_BY_ROOT`.
+    pub data_column_sidecars_by_root: RR,
+    /// Likewise — `protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT`.
+    pub execution_payload_envelopes_by_root: RR,
+}
+
+impl Behaviour {
+    /// `serving` ⇒ this host answers the light-client protocols, so
+    /// `updates_by_range` is advertised inbound as well as outbound.
+    fn new(
+        local_public_key: libp2p::identity::PublicKey,
+        serving: bool,
+        max_established_incoming: Option<u32>,
+    ) -> Self {
+        Self {
+            limits: connection_limits::Behaviour::new(
+                ConnectionLimits::default()
+                    .with_max_established_incoming(max_established_incoming)
+                    // A server sees many wallets behind one NAT, and a wallet
+                    // opening a second connection is normal; the per-peer cap
+                    // is about a single peer monopolising us, not about volume.
+                    .with_max_established_per_peer(Some(2))
+                    .with_max_pending_incoming(Some(if serving { 256 } else { 16 })),
+            ),
+            identify: identify::Behaviour::new(
+                identify::Config::new("eth2/1.0.0".into(), local_public_key)
+                    .with_agent_version(concat!("myotis/", env!("CARGO_PKG_VERSION"), "-rs").into()),
+            ),
+            // Anonymous on both sides matches the eth2 wire (StrictNoSign:
+            // messages carry no signature, key or seqno); nothing is ever
+            // published or subscribed, so this only shapes the handshake.
+            gossipsub: gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Anonymous,
+                gossipsub::ConfigBuilder::default()
+                    .validation_mode(gossipsub::ValidationMode::Anonymous)
+                    .build()
+                    .expect("static gossipsub config"),
+            )
+            .expect("static gossipsub behaviour"),
+            status_v2: rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT),
+            status_v1: rr(protocols::STATUS_V1, ProtocolSupport::Full, RESP_TIMEOUT),
+            ping: rr(protocols::PING, ProtocolSupport::Full, RESP_TIMEOUT),
+            metadata: rr(protocols::METADATA_V2, ProtocolSupport::Full, RESP_TIMEOUT),
+            metadata_v3: rr(protocols::METADATA_V3, ProtocolSupport::Full, RESP_TIMEOUT),
+            goodbye: rr(protocols::GOODBYE, ProtocolSupport::Full, RESP_TIMEOUT),
+            bootstrap: rr(protocols::BOOTSTRAP, ProtocolSupport::Full, RESP_TIMEOUT),
+            // Outbound-only for a WALLET: it can't serve catch-up history, and
+            // the Java learned that advertising unservable protocols gets us
+            // goodbye'd ("durationMs=1 closes in the wild"). A serving host has
+            // the archive that makes the advertisement honest, so it goes Full.
+            updates: rr_with_streams(
+                protocols::UPDATES_BY_RANGE,
+                if serving {
+                    ProtocolSupport::Full
+                } else {
+                    ProtocolSupport::Outbound
+                },
+                UPDATES_TIMEOUT,
+                if serving { SERVING_UPDATES_MAX_STREAMS } else { 64 },
+            ),
+            finality: rr(protocols::FINALITY_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
+            optimistic: rr(protocols::OPTIMISTIC_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
+            // Inbound only: this host never asks anyone for blocks or columns.
+            // The request is drained, not buffered (`read_request`), so the
+            // default stream cap costs nothing and refuses nobody.
+            blocks_by_root: rr(protocols::BLOCKS_BY_ROOT, ProtocolSupport::Inbound, RESP_TIMEOUT),
+            data_column_sidecars_by_root: rr(
+                protocols::DATA_COLUMN_SIDECARS_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+            ),
+            execution_payload_envelopes_by_root: rr(
+                protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+            ),
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Service handle
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    /// Peer doesn't speak the protocol (negotiation failed) — the signal the
+    /// Java uses to blacklist a peer for updates_by_range.
+    UnsupportedProtocol,
+    Timeout,
+    DialFailure,
+    ConnectionClosed,
+    Io(String),
+    /// The service shut down before the request completed.
+    Shutdown,
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedProtocol => write!(f, "protocol negotiation failed"),
+            Self::Timeout => write!(f, "request timed out"),
+            Self::DialFailure => write!(f, "dial failed"),
+            Self::ConnectionClosed => write!(f, "connection closed"),
+            Self::Io(m) => write!(f, "io: {m}"),
+            Self::Shutdown => write!(f, "service shut down"),
+        }
+    }
+}
+impl std::error::Error for RequestError {}
+
+enum Command {
+    Request {
+        peer: PeerId,
+        /// The DNS name these candidates came from, if any — logging only.
+        dns_name: Option<String>,
+        /// Dial candidates in RESOLVER ORDER — a DNS name expands to every
+        /// address it resolves to, and order is load-bearing (see
+        /// [`resolve_dial_addrs`]).
+        addrs: Vec<Multiaddr>,
+        protocol: &'static str,
+        wire: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
+    },
+    PeerCount {
+        reply: oneshot::Sender<usize>,
+    },
+    /// Peers whose Identify advertised light_client_updates_by_range.
+    LcServers {
+        reply: oneshot::Sender<HashSet<PeerId>>,
+    },
+    /// The externally observed address, once EXTERNAL_ADDR_QUORUM peers agree.
+    ExternalAddress {
+        reply: oneshot::Sender<Option<ExternalAddress>>,
+    },
+    /// Dial peers purely to collect Identify observations of our own address.
+    /// Fire-and-forget: nothing is requested and no reply is sent, because the
+    /// answer arrives asynchronously as `observed_ips` and is read later via
+    /// [`Command::ExternalAddress`].
+    Observe {
+        peers: Vec<(PeerId, Multiaddr)>,
+    },
+    /// One snapshot of the catch-up peer-selection inputs — the LC-server set,
+    /// the per-peer `earliest_available_slot` map, and the per-peer Identify
+    /// agent — so a round fetches them in a single swarm round-trip instead of
+    /// three.
+    CatchupMeta {
+        reply: oneshot::Sender<CatchupPeerMeta>,
+    },
+    Shutdown,
+}
+
+/// Identify `agent_version` per CONNECTED peer, shared between the swarm task
+/// (which fills it on Identify and empties it on the last connection closing)
+/// and the sync loop, which stamps it on every log line that names a peer as
+/// `client=` — the same field the EL pool prints — so a log reader can tell
+/// which client served, refused or dropped us without a peer-id lookup. A
+/// plain lock rather than a swarm round-trip because the readers are log
+/// sites in the sync loop, which must not await the swarm to print a line.
+/// Holds the DISPLAY-SAFE form only — the agent is peer-chosen text, and the
+/// Identify handler runs it through `el::pool::log_client_id` (control
+/// characters dropped, 64-char cap) before it enters; log sites print it with
+/// `?`, as the EL pool does, so what the strip cannot classify is escaped.
+pub type AgentMap = Arc<std::sync::RwLock<HashMap<PeerId, String>>>;
+
+/// The `client=` label for a peer: its (sanitized) Identify agent, or `?`
+/// before Identify arrived or after its connection closed. Poison-tolerant: a
+/// panic on the other side of the lock loses nothing a log label needs.
+fn client_label(agents: &AgentMap, peer: &PeerId) -> String {
+    agents
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(peer)
+        .cloned()
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Cheap-to-clone client for issuing eth2 req/resp calls against the running
+/// swarm task. Independent instances of the whole stack are independent — no
+/// globals anywhere in this crate.
+#[derive(Clone)]
+pub struct ReqRespClient {
+    tx: mpsc::Sender<Command>,
+    /// See [`AgentMap`]; read by [`ReqRespClient::client_of`].
+    agents: AgentMap,
+    /// Last answer seen per DNS name, so repeat resolutions can log at DEBUG
+    /// while a CHANGE still logs at INFO.
+    ///
+    /// Per-instance, not a global: independent stacks stay independent, which is
+    /// this crate's standing rule. Bounded by the number of distinct pinned
+    /// names, which is a handful.
+    last_resolved: Arc<std::sync::Mutex<HashMap<String, Vec<IpAddr>>>>,
+}
+
+impl ReqRespClient {
+    /// The `client=` label for a log line naming `peer`: its Identify agent
+    /// (`Lighthouse/v8.3.0-…`, `nimbus-eth2/v26.7.0`, …), or `?` when Identify
+    /// has not arrived or the peer is no longer connected. Synchronous and
+    /// lock-only, so a log site in the sync loop can call it inline.
+    pub fn client_of(&self, peer: &PeerId) -> String {
+        client_label(&self.agents, peer)
+    }
+
+    /// One request against `peer` (dialing `addr` if not connected): sends the
+    /// pre-encoded wire bytes, returns the raw wire response.
+    pub async fn request_raw(
+        &self,
+        peer: PeerId,
+        addr: Multiaddr,
+        protocol: &'static str,
+        wire: Vec<u8>,
+    ) -> Result<Vec<u8>, RequestError> {
+        self.request_raw_at(peer, vec![addr], protocol, wire).await
+    }
+
+    /// [`request_raw`](Self::request_raw) with every address the peer is known
+    /// at, in preference order (TCP before QUIC for a discovered peer — see
+    /// `sync::Peer::dial_addrs` for why not the spec's order). The order
+    /// decides which connection this node OPENS; a connection that already
+    /// exists, on either transport, carries the request (same doc). The
+    /// addresses are tried ONE AT A TIME, and the next is tried only when the
+    /// dial itself failed: a request that reached a connection and then failed
+    /// (timeout, a refused protocol, a closed stream) is the peer's answer, not
+    /// a reason to try the same peer over another transport. The swarm could
+    /// dial them all at once instead — libp2p's dial concurrency factor — but
+    /// then whichever handshake completes first wins, and that is QUIC's
+    /// 1-RTT more often than not, which is the connection this order exists
+    /// to avoid landing on.
+    pub async fn request_raw_at(
+        &self,
+        peer: PeerId,
+        addrs: Vec<Multiaddr>,
+        protocol: &'static str,
+        mut wire: Vec<u8>,
+    ) -> Result<Vec<u8>, RequestError> {
+        // An empty list would work exactly as long as the peer happens to be
+        // connected and fail the moment it is not — a contract violation that
+        // must not depend on connection state to show itself.
+        debug_assert!(!addrs.is_empty(), "request_raw_at needs at least one address");
+        let count = addrs.len();
+        for (i, addr) in addrs.into_iter().enumerate() {
+            let is_last = i + 1 == count;
+            // The bytes are cloned only while another attempt may follow.
+            let bytes = if is_last { std::mem::take(&mut wire) } else { wire.clone() };
+            match self.request_raw_once(peer, addr, protocol, bytes).await {
+                Err(RequestError::DialFailure) if !is_last => continue,
+                outcome => return outcome,
+            }
+        }
+        Err(RequestError::DialFailure)
+    }
+
+    /// One attempt at one address — after DNS resolution, which can yield
+    /// several concrete candidates for a name; THOSE are dialed concurrently,
+    /// resolver order first (see `resolve_dial_addrs`).
+    async fn request_raw_once(
+        &self,
+        peer: PeerId,
+        addr: Multiaddr,
+        protocol: &'static str,
+        wire: Vec<u8>,
+    ) -> Result<Vec<u8>, RequestError> {
+        // Resolve HERE, per request, in async context. The swarm task's dial
+        // path is synchronous, so it cannot await a lookup — and libp2p's own
+        // DNS transport is not always present (Android has no /etc/resolv.conf,
+        // so `build_swarm` falls back to plain TCP and a /dns4/ address is
+        // rejected outright with "Multiaddr is not supported").
+        let dns_name = multiaddr_dns_name(&addr);
+        // Never empty: a resolver failure yields the original address, so an
+        // already-connected peer is unaffected by a transient DNS blip.
+        let addrs = resolve_dial_addrs(&addr, &self.last_resolved).await;
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Request { peer, dns_name, addrs, protocol, wire, reply })
+            .await
+            .map_err(|_| RequestError::Shutdown)?;
+        rx.await.map_err(|_| RequestError::Shutdown)?
+    }
+
+    /// The address peers say they see us on, once at least
+    /// [`EXTERNAL_ADDR_QUORUM`] distinct peers agree on it.
+    ///
+    /// `None` until enough peers have reported — which is the honest answer, not
+    /// a failure: a server with too few connections genuinely does not know its
+    /// own address, and acting on a guess is how a published record ends up
+    /// pointing somewhere dead.
+    /// Dial `peers` for the sole purpose of learning our own external address.
+    ///
+    /// A host that only ever ACCEPTS connections never learns this. Identify
+    /// reports what the remote observes about us, so it takes a connection to
+    /// produce one — and [`external_address`](Self::external_address) needs
+    /// [`EXTERNAL_ADDR_QUORUM`] of them from distinct source IPs. A wallet gets
+    /// these for free from the peers it syncs against; a pure server
+    /// (`rust/roost`) has no such traffic and would sit below quorum forever.
+    ///
+    /// The observations are BOUNDED BY THE CONNECTION: they are dropped when it
+    /// closes, and idle connections close after 120s. So this establishes a
+    /// quorum that is momentary by design, not a standing one. Callers should
+    /// re-probe on a cadence and treat a `None` from `external_address` as "no
+    /// fresh reading", not as "the address is gone".
+    ///
+    /// Fire-and-forget: dial failures are logged, not returned. Probing is a
+    /// best-effort background concern and must never fail a caller's real work.
+    pub async fn observe_via(&self, peers: Vec<(PeerId, Multiaddr)>) {
+        if peers.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(Command::Observe { peers }).await;
+    }
+
+    pub async fn external_address(&self) -> Option<ExternalAddress> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::ExternalAddress { reply }).await.is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
+    }
+
+    pub async fn connected_peer_count(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::PeerCount { reply }).await.is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Peers whose Identify response advertised `light_client_updates_by_range`.
+    pub async fn lc_update_servers(&self) -> HashSet<PeerId> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::LcServers { reply }).await.is_err() {
+            return HashSet::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// The catch-up peer-selection inputs in one round-trip: the set of
+    /// Identify-confirmed LC servers, `earliest_available_slot` per peer
+    /// (from the auto-Status exchange), and each peer's Identify agent string.
+    /// Peers absent from the earliest map haven't completed Status yet
+    /// (unknown — never skipped); a v1 peer reports 0 (history from genesis).
+    /// Peers absent from the agent map haven't completed Identify yet.
+    pub async fn catchup_peer_meta(&self) -> CatchupPeerMeta {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::CatchupMeta { reply }).await.is_err() {
+            return CatchupPeerMeta::default();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.tx.send(Command::Shutdown).await;
+    }
+}
+
+/// Catch-up peer-selection inputs (see `ReqRespClient::catchup_peer_meta`).
+#[derive(Debug, Default, Clone)]
+pub struct CatchupPeerMeta {
+    pub lc_servers: HashSet<PeerId>,
+    pub earliest_slots: HashMap<PeerId, u64>,
+    pub agents: HashMap<PeerId, String>,
+}
+
+/// Shared local view the responder answers from. The sync loop refreshes it as
+/// the store advances so our Status stays honest (Lighthouse's relevance check
+/// requires a real block root — see the Java `buildLocalStatusFor` doc).
+pub struct LocalStatus {
+    inner: Mutex<StatusMessage>,
+}
+
+impl LocalStatus {
+    pub fn new(initial: StatusMessage) -> Arc<Self> {
+        Arc::new(Self { inner: Mutex::new(initial) })
+    }
+    pub fn set(&self, s: StatusMessage) {
+        *self.inner.lock().expect("status lock") = s;
+    }
+    pub fn get(&self) -> StatusMessage {
+        self.inner.lock().expect("status lock").clone()
+    }
+}
+
+/// How many DISTINCT peers must report the same address before it is believed.
+///
+/// One peer's `observed_addr` is not evidence: it can lie, and a peer behind the
+/// same NAT can be honestly wrong. This is the same reasoning discv5's endpoint
+/// prediction uses, and the reason Geth's `--nat stun` and Nimbus's
+/// `--enr-auto-update` do not act on a single report.
+///
+/// # What this is not
+///
+/// A floor against accident, **not** a defence against a determined Sybil. The
+/// answer is a plurality among connected peers, so an attacker who can hold more
+/// simultaneous connections than the honest peers reporting the true address can
+/// move it. That is tolerable while the result is only logged; before it drives
+/// a PUBLISHED ENR it wants at least one of:
+///
+/// - a majority of currently connected peers rather than a fixed floor,
+/// - cross-checking against discv5's own endpoint prediction, which is a
+///   different peer set reached over a different transport, or
+/// - refusing to act on a change until it survives several rounds.
+///
+/// The cost of getting it wrong is reachability, not correctness: a wrong
+/// address makes us undialable, it cannot make a wallet accept bad data.
+pub const EXTERNAL_ADDR_QUORUM: usize = 3;
+
+/// The address other peers say they see us on, once enough of them agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalAddress {
+    pub ip: IpAddr,
+    /// The port reporters see, when it is meaningful — see
+    /// [`ExternalAddress::port`]'s note below.
+    ///
+    /// Populated ONLY from inbound connections, where the reporter dialed us and
+    /// their view of our port is the externally mapped one. On an outbound
+    /// connection the port they see is our ephemeral source port and says
+    /// nothing about where we listen, so it is discarded. A server that never
+    /// dials therefore gets a real answer here, which is what makes a NAT
+    /// rewriting the port detectable rather than invisible.
+    pub port: Option<u16>,
+    /// Distinct reporters behind the winning address.
+    pub confirmations: usize,
+    /// Total distinct reporters. The denominator `confirmations` is out of —
+    /// without it a consumer cannot tell 3-of-3 from 3-of-200, nor implement a
+    /// majority rule without a second, racing round-trip.
+    pub reporters: usize,
+    /// Whether the winner is an address that could actually be reached from the
+    /// public internet. See [`is_routable`].
+    pub routable: bool,
+}
+
+impl ExternalAddress {
+    /// Whether the winner failed to clear half the reporters.
+    ///
+    /// A near-even split is the shape both a Sybil and a genuine mid-flight
+    /// address change produce, and the tie-break makes each CALL deterministic
+    /// without making the SEQUENCE stable — one more reporter can flip the
+    /// winner. A consumer that publishes a record should wait rather than act on
+    /// a contested answer.
+    pub fn is_contested(&self) -> bool {
+        self.confirmations * 2 <= self.reporters
+    }
+}
+
+/// Whether an address could be reached from the public internet.
+///
+/// `IpAddr::is_global()` is still unstable on the pinned toolchain, so the
+/// classes are spelled out. This exists because the mechanism will happily
+/// establish `127.0.0.1` or `192.168.x.x` — a couple of wallets on the same LAN
+/// can reach quorum before any internet peer does — and a record carrying a
+/// non-routable IP fails in exactly the way publishing an address is meant to
+/// prevent.
+pub fn is_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                // 100.64.0.0/10, carrier-grade NAT — routable-looking, not reachable.
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7 unique-local
+                || (v6.octets()[0] & 0xfe) == 0xfc
+                // fe80::/10 link-local
+                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80))
+        }
+    }
+}
+
+/// Extract the IP from a libp2p multiaddr.
+///
+/// Only the IP is meaningful. Identify reports the remote address of the
+/// connection as the reporter sees it, so for a connection WE dialed that is our
+/// source IP with an ephemeral port — the port says nothing about where we
+/// listen. Callers pair the IP with their own configured listen port.
+fn multiaddr_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Ip4(v4) => Some(IpAddr::V4(v4)),
+        Protocol::Ip6(v6) => Some(IpAddr::V6(v6)),
+        _ => None,
+    })
+}
+
+/// The TCP port of a multiaddr — and ONLY TCP: this feeds the observed
+/// external address a server publishes as its ENR `tcp` port, and an inbound
+/// QUIC connection would report our UDP port there instead. See
+/// [`multiaddr_transport_port`] for the dial side.
+fn multiaddr_port(addr: &Multiaddr) -> Option<u16> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Tcp(port) => Some(port),
+        _ => None,
+    })
+}
+
+/// The transport port of a dial address, TCP or UDP (`/udp/<port>/quic-v1`).
+fn multiaddr_transport_port(addr: &Multiaddr) -> Option<u16> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Tcp(port) | Protocol::Udp(port) => Some(port),
+        _ => None,
+    })
+}
+
+/// The DNS name in a multiaddr, if it is dialed by name rather than by address.
+///
+/// Used only for logging: libp2p resolves the name inside the transport, so
+/// without this the operator sees a connection to an IP with no indication that
+/// a name was involved, or which one — and on a dynamic address the whole point
+/// is being able to see what the name currently points at.
+fn multiaddr_dns_name(addr: &Multiaddr) -> Option<String> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Dns(n) | Protocol::Dns4(n) | Protocol::Dns6(n) | Protocol::Dnsaddr(n) => {
+            Some(n.to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Expand a dial address into concrete candidates, resolving any DNS component.
+///
+/// Returns the input unchanged when there is no name to resolve.
+///
+/// **Why we resolve rather than letting libp2p do it.** `build_swarm` layers in
+/// libp2p's DNS transport when a system resolver is configured, but that reads
+/// `/etc/resolv.conf`, which Android has not had since Oreo. There the swarm
+/// falls back to plain TCP and rejects a `/dns4/` address outright — "Multiaddr
+/// is not supported" — before any connection is attempted. `getaddrinfo`, which
+/// `lookup_host` uses, works on every platform we ship.
+///
+/// **Order is load-bearing.** `getaddrinfo` already sorts by RFC 6724
+/// destination-address selection, and every candidate is passed on in that
+/// order. On an IPv6-only mobile network with DNS64/NAT64 the synthesized
+/// `64:ff9b::/96` address sorts first and is the one that works, while the raw
+/// A record is unroutable there — so preferring IPv4 by hand would break
+/// exactly the networks this exists to support.
+///
+/// Substituting the address is safe: Noise still authenticates the remote
+/// against the `/p2p/` peer id, so a wrong or hostile answer cannot impersonate
+/// the pinned server — it can only fail to connect.
+async fn resolve_dial_addrs(
+    addr: &Multiaddr,
+    last: &std::sync::Mutex<HashMap<String, Vec<IpAddr>>>,
+) -> Vec<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let Some(name) = multiaddr_dns_name(addr).map(|n| n.to_string()) else {
+        return vec![addr.clone()];
+    };
+    // Without a /tcp/ or /udp/ component there is nothing to rebuild around:
+    // `skip_while` would consume the whole iterator and every candidate would
+    // come out a bare /ip4/A — no port, no transport, no /p2p/ id — while
+    // `unwrap_or(0)` looked the name up on port 0. Hand the address back
+    // untouched instead and let the transport reject it on its own terms.
+    // Reaches here via /dnsaddr/ (which resolves to TXT records, not A/AAAA)
+    // and via a name with no transport.
+    let Some(port) = multiaddr_transport_port(addr) else {
+        return vec![addr.clone()];
+    };
+    let tail: Vec<Protocol> = addr
+        .iter()
+        .skip_while(|p| !matches!(p, Protocol::Tcp(_) | Protocol::Udp(_)))
+        .map(|p| p.acquire())
+        .collect();
+    match tokio::net::lookup_host(format!("{name}:{port}")).await {
+        Ok(found) => {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            for sa in found {
+                if !seen.insert(sa.ip()) {
+                    continue;
+                }
+                let mut m = Multiaddr::empty();
+                m.push(match sa.ip() {
+                    IpAddr::V4(a) => Protocol::Ip4(a),
+                    IpAddr::V6(a) => Protocol::Ip6(a),
+                });
+                for p in &tail {
+                    m.push(p.clone());
+                }
+                out.push(m);
+            }
+            if out.is_empty() {
+                tracing::warn!(%name, "DNS-PIN resolve EMPTY — name exists but has no A/AAAA record");
+                return vec![addr.clone()];
+            } else {
+                // INFO on the FIRST answer and on any CHANGE; DEBUG for a repeat
+                // of what we already saw. Resolution runs per request, so a
+                // flat INFO here repeated every few seconds forever and buried
+                // the two events that actually matter — the first answer, and
+                // the address moving — in the noise, on a phone especially.
+                let ips: Vec<IpAddr> = out.iter().filter_map(multiaddr_ip).collect();
+                // Compare as a SET, not as an ordered list. `ips` is in
+                // getaddrinfo's RFC 6724 order, which is a function of the local
+                // network as well as the record — dual-stack source-address
+                // selection can reorder the same two addresses between calls. On
+                // an ordered compare that reads as ADDRESS CHANGED at INFO, and
+                // a false alarm on exactly the line an operator is watching for a
+                // real one is worse than the noise this commit removes.
+                let mut key = ips.clone();
+                key.sort();
+                let previous = last.lock().ok().and_then(|mut m| m.insert(name.clone(), key.clone()));
+                let shown = ips.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                match previous {
+                    Some(prev) if prev == key => {
+                        tracing::debug!(%name, resolved = %shown, "DNS-PIN resolved (unchanged)");
+                    }
+                    Some(prev) => {
+                        let was = prev.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                        tracing::info!(%name, was = %was, resolved = %shown,
+                            "DNS-PIN resolved — ADDRESS CHANGED");
+                    }
+                    None => tracing::info!(%name, resolved = %shown, "DNS-PIN resolved"),
+                }
+            }
+            out
+        }
+        Err(e) => {
+            // Hand back the ORIGINAL rather than nothing. `request_raw` resolves
+            // before it can know whether a dial is even needed — connection state
+            // lives on the swarm task — so returning empty made a transient
+            // resolver blip fail requests on peers we were already connected to,
+            // where the candidates would never have been used. The failure is
+            // logged; if a dial really is required it fails on its own.
+            tracing::warn!(%name, error = %e, "DNS-PIN resolve FAILED");
+            vec![addr.clone()]
+        }
+    }
+}
+
+/// One peer's report: where they reached us from, and what they see us as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Observation {
+    source: IpAddr,
+    ip: IpAddr,
+    /// Only set for inbound connections — see [`ExternalAddress::port`].
+    port: Option<u16>,
+}
+
+/// A source of pre-encoded light-client responses.
+///
+/// This is the seam that lets a SERVER (`rust/roost`) reuse this host verbatim
+/// instead of standing up a second libp2p stack — the design's "one protocol
+/// stack, not two". The wallet passes `None` and keeps behaving exactly as
+/// before: the four light-client protocols fall through to
+/// `ResourceUnavailable`.
+///
+/// Every method returns the **fully encoded response body** (`result byte ||
+/// fork digest || varint || snappy frames`), because these are called from
+/// [`respond_inbound`], which is **synchronous** and runs inline on the swarm
+/// task. There is no await point here: an implementation must be a pure cache
+/// read, never an I/O fetch. `None` means miss, and the caller answers
+/// `ResourceUnavailable` — correct behaviour, since a wallet simply retries
+/// against another peer.
+pub trait LcResponder: Send + Sync {
+    fn bootstrap(&self, block_root: &[u8; 32]) -> Option<Vec<u8>>;
+    fn updates_by_range(&self, start_period: u64, count: u64) -> Option<Vec<u8>>;
+    fn finality_update(&self) -> Option<Vec<u8>>;
+    fn optimistic_update(&self) -> Option<Vec<u8>>;
+}
+
+/// How to build the host. [`HostConfig::default`] is the wallet's shape.
+pub struct HostConfig {
+    /// EngineCore: cap all established consensus connections.
+    pub max_connections: Option<u32>,
+    /// Where to listen. The wallet uses an ephemeral port because some peers
+    /// reject dial-only hosts; a server pins one so its ENR stays valid.
+    pub listen: Multiaddr,
+    /// The QUIC listener (`/ip4/<ip>/udp/<port>/quic-v1`), `None` for TCP only.
+    /// Dialing QUIC never needs it — the transport opens a socket per dial —
+    /// but a listener lets inbound QUIC in and reuses one socket for dials.
+    /// The wallet's default is ephemeral, like `listen`; a server that wants
+    /// its QUIC port reachable also has to forward it and put it in its ENR
+    /// (`quic`), which `rust/roost` does not do yet.
+    pub listen_quic: Option<Multiaddr>,
+    /// Cap on established inbound connections. The wallet's 64 is
+    /// defense-in-depth; a server sets its own, which is the entire point of
+    /// splitting it out of a beacon node whose limit it would otherwise inherit.
+    pub max_established_incoming: Option<u32>,
+    /// Identity key. `None` generates a fresh one — right for a wallet, fatal
+    /// for a published server, where every restart would mint a new node ID and
+    /// invalidate every cached `/p2p/<peer-id>`.
+    pub keypair: Option<libp2p::identity::Keypair>,
+    /// Present ⇒ serve the light-client protocols, and advertise
+    /// `updates_by_range` inbound.
+    pub lc_responder: Option<Arc<dyn LcResponder>>,
+    /// Fed every peer's Status `fork_digest` (with the peer's source address),
+    /// so a fork this build does not know surfaces as an upgrade advisory.
+    pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    /// Counts every connection's bytes into this meter's CL layer
+    /// ([`crate::traffic`]). None (the default) counts nothing.
+    pub traffic: Option<Arc<crate::traffic::TrafficMeter>>,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            listen: "/ip4/0.0.0.0/tcp/0".parse().expect("static multiaddr"),
+            listen_quic: Some("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("static multiaddr")),
+            max_established_incoming: Some(64),
+            max_connections: None,
+            keypair: None,
+            lc_responder: None,
+            cl_fork_watch: None,
+            traffic: None,
+        }
+    }
+}
+
+/// Start the libp2p host and its event-loop task. Returns the request client;
+/// the task exits on [`ReqRespClient::shutdown`] (or when every client is dropped).
+pub fn start_host(local_status: Arc<LocalStatus>) -> Result<ReqRespClient, String> {
+    // The wallet drops the JoinHandle: dropping it does not abort the task, and
+    // a wallet that loses its host recovers by its own reconnect paths rather
+    // than by exiting the process.
+    start_host_with(local_status, HostConfig::default()).map(|(client, _, _)| client)
+}
+
+/// [`start_host`] with explicit configuration. Also returns the local peer id
+/// (a server needs it to publish a dialable multiaddr) and the swarm task's
+/// `JoinHandle`.
+///
+/// **A server must watch that handle.** The swarm task owns the listener and
+/// every connection, so if it ends — panic or otherwise — the host stops
+/// accepting while the process keeps running perfectly happily. Nothing else
+/// notices: the caller's `ReqRespClient` still exists and background pollers
+/// keep polling. A supervisor cannot help with a process that never exits, so
+/// detecting it is the owner's job. See `roost::serve`, which exits non-zero.
+/// Build the swarm, optionally with the DNS resolution layer.
+///
+/// Two near-identical chains rather than one with a branch: `with_dns()`
+/// consumes the builder and does not hand it back on failure, so recovering
+/// from a failed DNS setup means building again from the identity.
+fn build_swarm(
+    keypair: libp2p::identity::Keypair,
+    serving: bool,
+    max_incoming: Option<u32>,
+    dns: bool,
+    traffic: Arc<crate::traffic::TrafficMeter>,
+) -> Result<Swarm<Behaviour>, String> {
+    let base = libp2p::SwarmBuilder::with_existing_identity(keypair).with_tokio();
+    let idle = |c: libp2p::swarm::Config| c.with_idle_connection_timeout(Duration::from_secs(120));
+    let behaviour = |key: &libp2p::identity::Keypair| {
+        Behaviour::new(key.public(), serving, max_incoming)
+    };
+    // The transport is assembled here rather than by the builder's
+    // `with_tcp`/`with_quic` so the bytes can be counted (`crate::traffic`):
+    // TCP below noise (the socket's every byte), QUIC per substream (its own
+    // socket is not exposed). Otherwise it is exactly what those two build:
+    // TCP + noise + both muxers, or'ed with QUIC.
+    //
+    // Both stream multiplexers, yamux proposed first. The consensus p2p spec
+    // (phase0/p2p-interface.md, "Multiplexing") has it the other way round
+    // from what rust-libp2p ships by default: a TCP-capable client "MUST
+    // support mplex and MAY support yamux", and where both exist "yamux MUST
+    // take precedence during negotiation" — the `SelectUpgrade` order IS that
+    // precedence. Nimbus dropped yamux in 2024 (status-im/nimbus-eth2#6636)
+    // and speaks only mplex on TCP, as does Lodestar, so a yamux-only host
+    // (this one, before mplex was added) completed noise with every Nimbus
+    // node and then died on the muxer proposal — which is how zbox's own
+    // Nimbus, pinned for both engines
+    // in August, got dropped in September as "the libp2p handshake times out"
+    // (71f8a9d2), and why after the Sepolia Gloas fork roost was the only
+    // light-client server the Rust engine could reach (#573). The Java engine
+    // always offered both.
+    //
+    // QUIC beside TCP: the spec's PRIMARY transport since consensus-specs#5330
+    // ("QUIC MUST be supported", TCP is the fallback), and what every client
+    // listens on by default now (Nimbus `--quic-port`, Lighthouse, Teku,
+    // Lodestar, Prysm behind a flag). It brings its own TLS 1.3 handshake
+    // (libp2p-tls, peer id in the certificate) and stream multiplexing, so
+    // noise and the muxers above apply to TCP only. Addresses are
+    // `/ip4/<ip>/udp/<port>/quic-v1`; a peer known at both is dialed at TCP
+    // first, QUIC only when the TCP dial fails — one at a time, never
+    // concurrently (see `ReqRespClient::request_raw_at` for why).
+    let transport = |key: &libp2p::identity::Keypair| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
+        use libp2p::core::muxing::StreamMuxerBox;
+        use libp2p::core::upgrade::{SelectUpgrade, Version};
+        use libp2p::Transport as _;
+        let tcp_meter = Arc::clone(&traffic);
+        let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
+            .map(move |stream, _| {
+                crate::traffic::CountingStream::new(stream, Arc::clone(&tcp_meter), crate::traffic::cl)
+            })
+            .upgrade(Version::V1Lazy)
+            .authenticate(libp2p::noise::Config::new(key)?)
+            .multiplex(SelectUpgrade::new(
+                libp2p::yamux::Config::default(),
+                libp2p_mplex::Config::default(),
+            ))
+            .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+        let quic_meter = Arc::clone(&traffic);
+        let quic = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(key)).map(
+            move |(p, c), _| {
+                (p, StreamMuxerBox::new(crate::traffic::CountingMuxer::new(c, Arc::clone(&quic_meter))))
+            },
+        );
+        Ok(tcp.or_transport(quic).map(|either, _| either.into_inner()))
+    };
+    if dns {
+        Ok(base
+            .with_other_transport(transport)
+            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
+            .with_dns()
+            .map_err(|e| format!("dns transport setup failed: {e}"))?
+            .with_behaviour(behaviour)
+            .map_err(|e| format!("behaviour setup failed: {e}"))?
+            .with_swarm_config(idle)
+            .build())
+    } else {
+        Ok(base
+            .with_other_transport(transport)
+            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
+            .with_behaviour(behaviour)
+            .map_err(|e| format!("behaviour setup failed: {e}"))?
+            .with_swarm_config(idle)
+            .build())
+    }
+}
+
+pub fn start_host_with(
+    local_status: Arc<LocalStatus>,
+    config: HostConfig,
+) -> Result<(ReqRespClient, PeerId, tokio::task::JoinHandle<()>), String> {
+    // Ethereum CL spec requires secp256k1 identity keys (same as the Java
+    // HostBuilder's KeyType.SECP256K1) — the default ed25519 would make some
+    // peers reject the noise handshake payload.
+    let keypair = config
+        .keypair
+        .unwrap_or_else(libp2p::identity::Keypair::generate_secp256k1);
+    let serving = config.lc_responder.is_some();
+    let max_incoming = config.max_established_incoming;
+    // DNS is layered in so `/dns4/host/tcp/port/p2p/<id>` peers resolve AT DIAL
+    // TIME, every dial, honouring the record's TTL. That is what lets a server
+    // on a dynamic residential address be pinned by NAME instead of by a literal
+    // IP that goes stale (rust/roost).
+    //
+    // It must not be load-bearing, because it CANNOT be relied on everywhere:
+    // the system resolver is configured from /etc/resolv.conf, which Android has
+    // not had since Oreo (DNS goes through netd), so this legitimately fails
+    // there. Android is a first-class consumer (CLAUDE.md, Platform & language
+    // direction), and failing the whole host over an optional transport layer
+    // would take out `/ip4/` peers — every peer we pin today — on the default
+    // Android path.
+    //
+    // So: try with DNS, fall back to plain TCP with a warning. The degraded mode
+    // is exactly today's behaviour, and the warning names what stops working.
+    // No meter: count into one nobody reads (tools, roost, tests).
+    let traffic = config.traffic.clone().unwrap_or_default();
+    let mut swarm = match build_swarm(keypair.clone(), serving, max_incoming, true, Arc::clone(&traffic)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "no system DNS resolver — continuing WITHOUT the DNS transport; \
+                 /ip4/ peers are unaffected but /dns4/ peers cannot be dialed");
+            build_swarm(keypair, serving, max_incoming, false, traffic)?
+        }
+    };
+
+    if let Some(max) = config.max_connections {
+        swarm.behaviour_mut().limits = connection_limits::Behaviour::new(
+            ConnectionLimits::default()
+                .with_max_established(Some(max))
+                .with_max_established_incoming(config.max_established_incoming)
+                .with_max_pending_outgoing(Some(1))
+                .with_max_pending_incoming(Some(0))
+                .with_max_established_per_peer(Some(1)),
+        );
+    }
+
+    swarm
+        .listen_on(config.listen)
+        .map_err(|e| format!("listen failed: {e}"))?;
+    // Not fatal: a host that cannot bind a UDP socket still dials QUIC peers
+    // (the transport opens a socket per dial) and still has TCP both ways.
+    if let Some(quic) = config.listen_quic {
+        if let Err(e) = swarm.listen_on(quic) {
+            tracing::warn!(error = %e,
+                "QUIC listen failed — continuing without inbound QUIC; dialing QUIC and TCP are unaffected");
+        }
+    }
+
+    let peer_id = *swarm.local_peer_id();
+    tracing::info!(peer_id = %peer_id, serving, "libp2p host starting");
+
+    let (tx, rx) = mpsc::channel(256);
+    let agents: AgentMap = Arc::default();
+    let task = tokio::spawn(run_swarm(
+        swarm,
+        rx,
+        local_status,
+        config.lc_responder,
+        config.cl_fork_watch,
+        agents.clone(),
+    ));
+    Ok((ReqRespClient { tx, agents, last_resolved: Arc::default() }, peer_id, task))
+}
+
+/// What a pending outbound request id maps back to.
+enum Pending {
+    External(oneshot::Sender<Result<Vec<u8>, RequestError>>),
+    /// Fire-and-forget auto-Status (v2, falls back to v1 on unsupported protocol).
+    AutoStatusV2(PeerId),
+    AutoStatusV1(PeerId),
+}
+
+/// A request parked until the peer's Status handshake completes.
+struct QueuedRequest {
+    addrs: Vec<Multiaddr>,
+    protocol: &'static str,
+    wire: Vec<u8>,
+    reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
+}
+
+struct SwarmCtx {
+    /// What each outstanding outbound request's outcome completes.
+    ///
+    /// Keyed by (protocol, id) for the same reason as `in_flight`:
+    /// `OutboundRequestId` is issued PER behaviour, each counting from 1. Keyed
+    /// on the id alone, a new peer's auto-Status and a bootstrap to another peer
+    /// could share an id. The second insert evicted the first entry — a caller
+    /// saw "service shut down", an auto-Status never settled and stranded the
+    /// requests parked behind it — and the first outcome to arrive completed
+    /// the survivor, handing a bootstrap caller Status bytes. Only
+    /// [`send_tracked`] inserts, so a key always names the behaviour that issued it.
+    pending: HashMap<(&'static str, OutboundRequestId), Pending>,
+    connected: HashSet<PeerId>,
+    /// Peers we dialed BY NAME, and the name used. Logging only — cleared when
+    /// the dial resolves one way or the other.
+    dns_dials: HashMap<PeerId, String>,
+    /// Peers whose spec-required first Status exchange has completed (either
+    /// way). Requests to peers not in this set are parked in `queued` —
+    /// opening a light_client stream before Status completes gets the whole
+    /// connection dropped by Lighthouse/Teku (see the Java autoStatus doc).
+    status_done: HashSet<PeerId>,
+    queued: HashMap<PeerId, Vec<QueuedRequest>>,
+    lc_servers: HashSet<PeerId>,
+    /// `earliest_available_slot` learned from each peer's auto-Status reply.
+    peer_earliest: HashMap<PeerId, u64>,
+    /// Identify `agent_version` per peer — the catch-up fan-out sizes its
+    /// request per client family from this (see `sync::agent_serves_one_period`),
+    /// and the sync loop's log lines read it through [`ReqRespClient::client_of`]
+    /// (shared handle; see [`AgentMap`]).
+    peer_agents: AgentMap,
+    /// Peers whose current connection delivered a Goodbye, so the close that
+    /// follows is theirs by announcement, not a drop. Cleared with the close.
+    goodbye_from: HashSet<PeerId>,
+    local_status: Arc<LocalStatus>,
+    /// Present only on a serving host; `None` on a wallet, where the
+    /// light-client protocols answer `ResourceUnavailable` as before.
+    lc: Option<Arc<dyn LcResponder>>,
+    /// Response bytes handed to `send_response` but not yet written, plus their
+    /// running total. Bounded by [`MAX_IN_FLIGHT_RESPONSE_BYTES`].
+    ///
+    /// Keyed by (protocol, id) because `InboundRequestId` is issued PER
+    /// `request_response::Behaviour`, and this host runs one behaviour per
+    /// protocol — so two protocols can each mint id 1. Keyed on the id alone,
+    /// the second insert would overwrite the first while both lengths stayed in
+    /// the total, and whichever terminal event arrived first would release the
+    /// wrong entry: the budget leaks until everything is refused.
+    in_flight: HashMap<(&'static str, InboundRequestId), usize>,
+    in_flight_bytes: usize,
+    /// Per connected peer: (the address WE see them coming from, the address
+    /// THEY report seeing us on).
+    ///
+    /// The tally dedupes on the first element, not on the peer id — see
+    /// [`external_address`]. Dropped with the connection, so this is bounded by
+    /// the connected set.
+    observed_ips: HashMap<PeerId, Observation>,
+    /// Source address per peer plus whether THEY dialed US, learned at
+    /// connection time and needed before their Identify arrives.
+    peer_source_ips: HashMap<PeerId, (IpAddr, bool)>,
+    /// The CL fork watch every decoded peer Status is reported to.
+    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+}
+
+impl SwarmCtx {
+    fn new(
+        local_status: Arc<LocalStatus>,
+        lc: Option<Arc<dyn LcResponder>>,
+        cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+        agents: AgentMap,
+    ) -> Self {
+        Self {
+            cl_fork_watch,
+            pending: HashMap::new(),
+            connected: HashSet::new(),
+            dns_dials: HashMap::new(),
+            status_done: HashSet::new(),
+            queued: HashMap::new(),
+            lc_servers: HashSet::new(),
+            peer_earliest: HashMap::new(),
+            peer_agents: agents,
+            goodbye_from: HashSet::new(),
+            local_status,
+            lc,
+            in_flight: HashMap::new(),
+            in_flight_bytes: 0,
+            observed_ips: HashMap::new(),
+            peer_source_ips: HashMap::new(),
+        }
+    }
+}
+
+async fn run_swarm(
+    mut swarm: Swarm<Behaviour>,
+    mut rx: mpsc::Receiver<Command>,
+    local_status: Arc<LocalStatus>,
+    lc: Option<Arc<dyn LcResponder>>,
+    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    agents: AgentMap,
+) {
+    let mut ctx = SwarmCtx::new(local_status, lc, cl_fork_watch, agents);
+    loop {
+        tokio::select! {
+            cmd = rx.recv() => match cmd {
+                None | Some(Command::Shutdown) => {
+                    for (_, p) in ctx.pending.drain() {
+                        if let Pending::External(reply) = p {
+                            let _ = reply.send(Err(RequestError::Shutdown));
+                        }
+                    }
+                    for (_, queue) in ctx.queued.drain() {
+                        for q in queue {
+                            let _ = q.reply.send(Err(RequestError::Shutdown));
+                        }
+                    }
+                    tracing::info!("libp2p host stopping");
+                    return;
+                }
+                Some(Command::Request { peer, dns_name, addrs, protocol, wire, reply }) => {
+                    submit_request(
+                        &mut swarm, &mut ctx, peer, dns_name, addrs, protocol, wire, reply,
+                    );
+                }
+                Some(Command::PeerCount { reply }) => {
+                    let _ = reply.send(ctx.connected.len());
+                }
+                Some(Command::LcServers { reply }) => {
+                    let _ = reply.send(ctx.lc_servers.clone());
+                }
+                Some(Command::ExternalAddress { reply }) => {
+                    let _ = reply.send(external_address(&ctx.observed_ips));
+                }
+                Some(Command::Observe { peers }) => {
+                    for (peer, addr) in peers {
+                        // Skip peers we already hold a connection to: their
+                        // Identify has already been recorded, and a redundant
+                        // dial would only churn the connection.
+                        if ctx.connected.contains(&peer) {
+                            continue;
+                        }
+                        if let Some(name) = multiaddr_dns_name(&addr) {
+                            ctx.dns_dials.insert(peer, name);
+                        }
+                        use libp2p::swarm::dial_opts::DialOpts;
+                        let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
+                        match swarm.dial(opts) {
+                            Ok(()) => {}
+                            Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {}
+                            Err(e) => {
+                                tracing::debug!(peer = %peer, error = %e, "observation dial failed");
+                            }
+                        }
+                    }
+                }
+                Some(Command::CatchupMeta { reply }) => {
+                    let _ = reply.send(CatchupPeerMeta {
+                        lc_servers: ctx.lc_servers.clone(),
+                        earliest_slots: ctx.peer_earliest.clone(),
+                        agents: ctx.peer_agents.read().unwrap_or_else(|e| e.into_inner()).clone(),
+                    });
+                }
+            },
+            event = swarm.select_next_some() => handle_swarm_event(&mut swarm, &mut ctx, event),
+        }
+    }
+}
+
+/// Dispatch an external request. Peers that haven't completed the
+/// spec-required first Status exchange get the request PARKED until the
+/// auto-Status settles — Lighthouse/Teku drop connections whose first inbound
+/// stream isn't Status, which is exactly what a raced dial+request produces.
+fn submit_request(
+    swarm: &mut Swarm<Behaviour>,
+    ctx: &mut SwarmCtx,
+    peer: PeerId,
+    dns_name: Option<String>,
+    // Candidates in resolver order — see `resolve_dial_addrs`.
+    addrs: Vec<Multiaddr>,
+    protocol: &'static str,
+    wire: Vec<u8>,
+    reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
+) {
+    if ctx.status_done.contains(&peer) {
+        send_tracked(swarm, ctx, peer, protocol, wire, addrs, Pending::External(reply));
+        return;
+    }
+
+    ctx.queued
+        .entry(peer)
+        .or_default()
+        .push(QueuedRequest { addrs: addrs.clone(), protocol, wire, reply });
+    if !ctx.connected.contains(&peer) {
+        // The name is carried through rather than re-derived: by this point the
+        // candidates are concrete /ip4//ip6/ addresses, so the name only exists
+        // because the caller resolved it. Kept so a connection or dial failure
+        // can still be attributed to the pin that produced it.
+        if let Some(name) = dns_name {
+            ctx.dns_dials.insert(peer, name);
+        }
+        use libp2p::swarm::dial_opts::DialOpts;
+        // EVERY candidate, in resolver order: libp2p tries them in turn, which
+        // is what makes a NAT64 network work without special-casing it.
+        let opts = DialOpts::peer_id(peer).addresses(addrs).build();
+        match swarm.dial(opts) {
+            Ok(()) => {}
+            // Already dialing / connecting — the queued request rides along.
+            Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {}
+            Err(e) => {
+                tracing::debug!(peer = %peer, error = %e, "dial failed");
+                fail_queued(ctx, &peer, RequestError::DialFailure);
+            }
+        }
+    }
+}
+
+fn behaviour_for<'a>(swarm: &'a mut Swarm<Behaviour>, protocol: &str) -> Option<&'a mut RR> {
+    let behaviour = swarm.behaviour_mut();
+    Some(match protocol {
+        protocols::STATUS_V2 => &mut behaviour.status_v2,
+        protocols::STATUS_V1 => &mut behaviour.status_v1,
+        protocols::PING => &mut behaviour.ping,
+        protocols::METADATA_V2 => &mut behaviour.metadata,
+        protocols::METADATA_V3 => &mut behaviour.metadata_v3,
+        protocols::GOODBYE => &mut behaviour.goodbye,
+        protocols::BOOTSTRAP => &mut behaviour.bootstrap,
+        protocols::UPDATES_BY_RANGE => &mut behaviour.updates,
+        protocols::FINALITY_UPDATE => &mut behaviour.finality,
+        protocols::OPTIMISTIC_UPDATE => &mut behaviour.optimistic,
+        protocols::BLOCKS_BY_ROOT => &mut behaviour.blocks_by_root,
+        protocols::DATA_COLUMN_SIDECARS_BY_ROOT => &mut behaviour.data_column_sidecars_by_root,
+        protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT => {
+            &mut behaviour.execution_payload_envelopes_by_root
+        }
+        _ => return None,
+    })
+}
+
+/// Send `wire` on `protocol`'s behaviour and record what its outcome completes.
+///
+/// The only place a `pending` entry is created: the protocol that picks the
+/// behaviour is the protocol in the key, so a key can never name a behaviour
+/// other than the one that issued its id (see `SwarmCtx::pending`).
+fn send_tracked(
+    swarm: &mut Swarm<Behaviour>,
+    ctx: &mut SwarmCtx,
+    peer: PeerId,
+    protocol: &'static str,
+    wire: Vec<u8>,
+    addrs: Vec<Multiaddr>,
+    on_outcome: Pending,
+) {
+    let Some(rr) = behaviour_for(swarm, protocol) else {
+        // Only an external caller can name a protocol this host lacks; the
+        // auto-Status ones are this module's own constants.
+        if let Pending::External(reply) = on_outcome {
+            let _ = reply.send(Err(RequestError::Io(format!("unknown protocol {protocol}"))));
+        }
+        return;
+    };
+    let id = rr.send_request_with_addresses(&peer, wire, addrs);
+    ctx.pending.insert((protocol, id), on_outcome);
+}
+
+fn fail_queued(ctx: &mut SwarmCtx, peer: &PeerId, error: RequestError) {
+    if let Some(queue) = ctx.queued.remove(peer) {
+        for q in queue {
+            let _ = q.reply.send(Err(error.clone()));
+        }
+    }
+}
+
+/// The peer's Status handshake settled (either way): release its parked requests.
+fn mark_status_done(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer: PeerId) {
+    ctx.status_done.insert(peer);
+    let Some(queue) = ctx.queued.remove(&peer) else { return };
+    for q in queue {
+        send_tracked(swarm, ctx, peer, q.protocol, q.wire, q.addrs, Pending::External(q.reply));
+    }
+}
+
+fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: SwarmEvent<BehaviourEvent>) {
+    match event {
+        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            // Remember where this peer reached us from: the external-address
+            // tally dedupes on it, so a host cannot vote more than once by
+            // minting extra peer ids.
+            if let Some(ip) = multiaddr_ip(endpoint.get_remote_address()) {
+                ctx.peer_source_ips.insert(peer_id, (ip, endpoint.is_listener()));
+            }
+            let newly = ctx.connected.insert(peer_id);
+            // The name's CURRENT answer. libp2p resolves inside the transport,
+            // so this is the only place the mapping is observable — and on a
+            // dynamic address it is the thing an operator actually wants to
+            // see: which IP the name points at right now, confirmed by a
+            // connection that succeeded rather than by a lookup done elsewhere.
+            if let Some(name) = ctx.dns_dials.remove(&peer_id) {
+                // `endpoint.get_remote_address()` IS the concrete address now:
+                // since dialing resolves names itself, the candidates handed to
+                // the swarm are /ip4//ip6/, never /dns4/. So this line carries
+                // the address the connection actually went to — which matters
+                // because the resolve line is emitted once per distinct answer
+                // and would otherwise be the only place the IP ever appears.
+                tracing::info!(peer = %peer_id, %name,
+                    addr = %endpoint.get_remote_address(), "DNS-PIN connected");
+            }
+            tracing::debug!(peer = %peer_id, remote = %endpoint.get_remote_address(),
+                "connection established");
+            if newly {
+                // CL p2p spec: Status MUST be the first req/resp on a new
+                // connection; clients drop peers that skip it (see autoStatus
+                // in the Java service). v2 first, v1 fallback on negotiation
+                // failure. Parked requests flush when it settles.
+                let wire = codec::encode_request(&ctx.local_status.get().encode());
+                send_tracked(swarm, ctx, peer_id, protocols::STATUS_V2, wire, Vec::new(),
+                    Pending::AutoStatusV2(peer_id));
+            }
+        }
+        SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+            if num_established == 0 {
+                ctx.connected.remove(&peer_id);
+                let said_goodbye = ctx.goodbye_from.remove(&peer_id);
+                // Name the peer that dropped us (see `remote_drop_without_goodbye`
+                // for exactly which closes qualify), while its agent is still
+                // in the map — the clean-up below forgets it.
+                if let Some(e) =
+                    remote_drop_without_goodbye(&cause, ctx.status_done.contains(&peer_id), said_goodbye)
+                {
+                    tracing::info!(peer = %peer_id, client = ?client_label(&ctx.peer_agents, &peer_id),
+                        error = %e, "peer connection dropped without goodbye");
+                }
+                // Next connection must redo the Status handshake — and drop the
+                // per-peer metadata it produced so these maps stay bounded by
+                // the CONNECTED set, not by every peer ever seen (a reconnect
+                // re-runs Identify + auto-Status and repopulates both).
+                ctx.status_done.remove(&peer_id);
+                ctx.lc_servers.remove(&peer_id);
+                ctx.peer_agents.write().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
+                ctx.peer_earliest.remove(&peer_id);
+                ctx.observed_ips.remove(&peer_id);
+                ctx.peer_source_ips.remove(&peer_id);
+                fail_queued(ctx, &peer_id, RequestError::ConnectionClosed);
+                tracing::debug!(peer = %peer_id, "connection closed");
+            }
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+            if let Some(name) = ctx.dns_dials.remove(&peer_id) {
+                // WARN, not debug: a pinned name that stops resolving makes the
+                // server unreachable to every wallet at once, and it is
+                // otherwise indistinguishable from the server being down.
+                tracing::warn!(peer = %peer_id, %name, error = %error,
+                    "DNS-PIN dial FAILED — the name did not resolve, or resolved to \
+                     an address that refused the connection");
+            }
+            tracing::debug!(peer = %peer_id, error = %error, "outgoing connection failed");
+            fail_queued(ctx, &peer_id, RequestError::DialFailure);
+        }
+        SwarmEvent::Behaviour(be) => handle_behaviour_event(swarm, ctx, be),
+        SwarmEvent::NewListenAddr { address, .. } => {
+            tracing::debug!(%address, "listening");
+        }
+        _ => {}
+    }
+}
+
+/// The one connection close worth an INFO line with the peer's client: the
+/// remote side ended it (`cause` is an I/O error — a reset, an EOF, or the
+/// remote shutting the transport down), on a peer whose auto-Status had
+/// settled (answered or failed: a peer we had done business with, not a dial
+/// that never got past the handshake), and no Goodbye came first. A Goodbye
+/// already logged itself (`peer sent goodbye`); an idle keep-alive expiry and
+/// a close we made ourselves (`cause` None) are routine and stay at debug.
+/// Returns the error to print. Nothing in this crate (or roost) SENDS a
+/// Goodbye today; if an outbound one is ever added, the close that follows
+/// it must be excluded here too, or this line would call our own leave a drop.
+fn remote_drop_without_goodbye(
+    cause: &Option<libp2p::swarm::ConnectionError>,
+    status_settled: bool,
+    said_goodbye: bool,
+) -> Option<&io::Error> {
+    match cause {
+        Some(libp2p::swarm::ConnectionError::IO(e)) if status_settled && !said_goodbye => Some(e),
+        _ => None,
+    }
+}
+
+fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: BehaviourEvent) {
+    use BehaviourEvent as E;
+    match event {
+        E::Identify(identify::Event::Received { peer_id, info, .. }) => {
+            let lc = info
+                .protocols
+                .iter()
+                .any(|p| p.as_ref().contains("light_client_updates_by_range"));
+            if lc {
+                ctx.lc_servers.insert(peer_id);
+            }
+            if let (Some(ip), Some((source, inbound))) = (
+                multiaddr_ip(&info.observed_addr),
+                ctx.peer_source_ips.get(&peer_id).copied(),
+            ) {
+                // The port is only meaningful when THEY dialed US: then what
+                // they see is our externally mapped port. On a connection we
+                // dialed it is our ephemeral source port.
+                let port = inbound.then(|| multiaddr_port(&info.observed_addr)).flatten();
+                ctx.observed_ips.insert(peer_id, Observation { source, ip, port });
+            }
+            // Stored in the display-safe form only (control characters gone,
+            // 64-char cap): the agent is peer-chosen text and every reader of
+            // this map prints it, so the one place it enters is the one place
+            // it is sanitized. The family prefix `agent_serves_one_period`
+            // matches on survives both the strip and the cap.
+            let agent = crate::el::pool::log_client_id(&info.agent_version);
+            tracing::debug!(peer = %peer_id, agent = ?agent,
+                protocols = info.protocols.len(), lc_updates = lc, "identify received");
+            ctx.peer_agents.write().unwrap_or_else(|e| e.into_inner()).insert(peer_id, agent);
+        }
+        E::Identify(_) => {}
+        // No subscriptions, so the only events are peers' subscription
+        // announcements and unsupported-protocol notices; none needs handling.
+        E::Gossipsub(_) => {}
+        E::StatusV2(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V2, ev),
+        E::StatusV1(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V1, ev),
+        E::Ping(ev) => on_rr_event(swarm, ctx, protocols::PING, ev),
+        E::Metadata(ev) => on_rr_event(swarm, ctx, protocols::METADATA_V2, ev),
+        E::MetadataV3(ev) => on_rr_event(swarm, ctx, protocols::METADATA_V3, ev),
+        E::Goodbye(ev) => on_rr_event(swarm, ctx, protocols::GOODBYE, ev),
+        E::Bootstrap(ev) => on_rr_event(swarm, ctx, protocols::BOOTSTRAP, ev),
+        E::Updates(ev) => on_rr_event(swarm, ctx, protocols::UPDATES_BY_RANGE, ev),
+        E::Finality(ev) => on_rr_event(swarm, ctx, protocols::FINALITY_UPDATE, ev),
+        E::Optimistic(ev) => on_rr_event(swarm, ctx, protocols::OPTIMISTIC_UPDATE, ev),
+        E::BlocksByRoot(ev) => on_rr_event(swarm, ctx, protocols::BLOCKS_BY_ROOT, ev),
+        E::DataColumnSidecarsByRoot(ev) => {
+            on_rr_event(swarm, ctx, protocols::DATA_COLUMN_SIDECARS_BY_ROOT, ev)
+        }
+        E::ExecutionPayloadEnvelopesByRoot(ev) => {
+            on_rr_event(swarm, ctx, protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, ev)
+        }
+    }
+}
+
+type RrEvent = request_response::Event<Vec<u8>, Vec<u8>>;
+
+fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'static str, event: RrEvent) {
+    match event {
+        request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Message::Response { request_id, response } => {
+                complete(ctx, swarm, protocol, request_id, peer, Ok(response));
+            }
+            request_response::Message::Request { request, channel, request_id, .. } => {
+                let mut response = respond_inbound(ctx, protocol, peer, &request);
+                // Refuse rather than queue when the in-flight budget is spent.
+                // ResourceUnavailable is the answer a wallet already knows how
+                // to handle, and it costs us nothing to hold. A zero-chunk
+                // answer is exempt: it holds nothing either, and swapping it
+                // for an error chunk would turn "none of these" into the
+                // failed request that ends Nimbus's peer loop (see
+                // `protocols::BLOCKS_BY_ROOT`) — on a roost under response
+                // pressure, exactly when it matters.
+                if !response.is_empty()
+                    && ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
+                {
+                    tracing::warn!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
+                        protocol, queued = ctx.in_flight_bytes, want = response.len(),
+                        "in-flight response budget exhausted — answering ResourceUnavailable");
+                    response = codec::encode_error_response(
+                        codec::RESULT_RESOURCE_UNAVAILABLE,
+                        "ResourceUnavailable",
+                    );
+                }
+                let response_len = response.len();
+                let Some(rr) = behaviour_for(swarm, protocol) else { return };
+                if rr.send_response(channel, response).is_err() {
+                    tracing::debug!(peer = %peer, protocol, "inbound response channel closed");
+                } else {
+                    ctx.in_flight.insert((protocol, request_id), response_len);
+                    ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_add(response_len);
+                }
+                // Goodbye means the peer is leaving. Answering without closing
+                // leaves us holding a connection its owner considers gone —
+                // which on a public responder is how the connection table fills
+                // with peers that will never talk again.
+                if protocol == protocols::GOODBYE {
+                    let _ = swarm.disconnect_peer_id(peer);
+                }
+            }
+        },
+        request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+            let mapped = match &error {
+                request_response::OutboundFailure::Timeout => RequestError::Timeout,
+                request_response::OutboundFailure::UnsupportedProtocols => {
+                    RequestError::UnsupportedProtocol
+                }
+                request_response::OutboundFailure::DialFailure => RequestError::DialFailure,
+                request_response::OutboundFailure::ConnectionClosed => {
+                    RequestError::ConnectionClosed
+                }
+                other => RequestError::Io(other.to_string()),
+            };
+            tracing::debug!(peer = %peer, protocol, error = %error, "outbound failure");
+            complete(ctx, swarm, protocol, request_id, peer, Err(mapped));
+        }
+        // Both terminal outcomes release the budget; missing either would leak it
+        // and converge on a responder that refuses everything.
+        request_response::Event::InboundFailure { peer, error, request_id, .. } => {
+            release_in_flight(ctx, protocol, request_id);
+            tracing::debug!(peer = %peer, protocol, error = %error, "inbound failure");
+        }
+        request_response::Event::ResponseSent { request_id, .. } => {
+            release_in_flight(ctx, protocol, request_id);
+        }
+    }
+}
+
+fn complete(
+    ctx: &mut SwarmCtx,
+    swarm: &mut Swarm<Behaviour>,
+    protocol: &'static str,
+    request_id: OutboundRequestId,
+    peer: PeerId,
+    result: Result<Vec<u8>, RequestError>,
+) {
+    match ctx.pending.remove(&(protocol, request_id)) {
+        Some(Pending::External(reply)) => {
+            let _ = reply.send(result);
+        }
+        // Stale: the peer's LAST connection closed before this outcome arrived.
+        // libp2p yields `SwarmEvent::ConnectionClosed` first and the request's
+        // `OutboundFailure` on a later poll, so the close handler has already
+        // reset the peer and failed its parked requests. Settling it now would
+        // mark a disconnected peer Status-done, sending its next requests ahead
+        // of the next connection's own auto-Status. Nothing can reconnect the
+        // peer in between: queued behaviour events drain before the pool is
+        // polled again.
+        Some(Pending::AutoStatusV2(peer_id) | Pending::AutoStatusV1(peer_id))
+            if !ctx.connected.contains(&peer_id) =>
+        {
+            tracing::debug!(peer = %peer_id, protocol, "auto-status outcome after disconnect — ignored");
+        }
+        Some(Pending::AutoStatusV2(peer_id)) => match result {
+            Ok(raw) => {
+                note_peer_status(ctx, "v2", peer_id, &raw);
+                mark_status_done(swarm, ctx, peer_id);
+            }
+            Err(RequestError::UnsupportedProtocol) => {
+                // v1-only peer (Nimbus bucket in the Java notes) — fall back.
+                let local = ctx.local_status.get();
+                let wire = codec::encode_request(&local.encode_v1());
+                send_tracked(swarm, ctx, peer_id, protocols::STATUS_V1, wire, Vec::new(),
+                    Pending::AutoStatusV1(peer_id));
+            }
+            Err(e) => {
+                tracing::debug!(peer = %peer_id, error = %e, "auto-status v2 failed");
+                // Settled (failed) — release parked requests rather than
+                // starving them; the peer may still serve other protocols.
+                mark_status_done(swarm, ctx, peer_id);
+            }
+        },
+        Some(Pending::AutoStatusV1(peer_id)) => {
+            match result {
+                Ok(raw) => note_peer_status(ctx, "v1", peer_id, &raw),
+                Err(e) => tracing::debug!(peer = %peer_id, error = %e, "auto-status v1 failed"),
+            }
+            mark_status_done(swarm, ctx, peer_id);
+        }
+        None => {
+            tracing::debug!(peer = %peer, protocol, %request_id,
+                "outcome for an untracked outbound request — dropped");
+        }
+    }
+}
+
+/// Record what a peer's auto-Status reply says: its `earliest_available_slot`
+/// for request routing, and its `fork_digest` for the CL fork watch (keyed by
+/// the connection's source address — one vote per source network).
+fn note_peer_status(ctx: &mut SwarmCtx, version: &str, peer_id: PeerId, raw: &[u8]) {
+    let Some((earliest, fork_digest)) = log_peer_status(version, peer_id, raw) else {
+        return;
+    };
+    ctx.peer_earliest.insert(peer_id, earliest);
+    if let (Some(watch), Some((ip, _))) = (&ctx.cl_fork_watch, ctx.peer_source_ips.get(&peer_id)) {
+        watch.observe_status(&crate::cl_fork_watch::source_of(*ip), fork_digest);
+    }
+}
+
+/// Logs a peer's auto-Status reply and returns its `earliest_available_slot`
+/// and `fork_digest` (None on a decode/frame error). v1 peers report an
+/// earliest slot of 0 — genesis history.
+fn log_peer_status(version: &str, peer: PeerId, raw: &[u8]) -> Option<(u64, [u8; 4])> {
+    match codec::decode_response(raw, false) {
+        Ok(d) => {
+            let decoded = if version == "v2" {
+                StatusMessage::decode(&d.ssz_payload)
+            } else {
+                StatusMessage::decode_v1(&d.ssz_payload)
+            };
+            match decoded {
+                Ok(s) => {
+                    tracing::debug!(peer = %peer, version,
+                        fork_digest = %hex4(&s.fork_digest),
+                        finalized_epoch = s.finalized_epoch, head_slot = s.head_slot,
+                        earliest = s.earliest_available_slot, "auto-status ok");
+                    Some((s.earliest_available_slot, s.fork_digest))
+                }
+                Err(e) => {
+                    tracing::debug!(peer = %peer, version, error = %e,
+                        "auto-status decode failed");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(peer = %peer, version, error = %e, "auto-status frame invalid");
+            None
+        }
+    }
+}
+
+fn hex4(b: &[u8; 4]) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
+}
+
+/// First 8 bytes of a root as hex — matches how `roost`'s store logs a
+/// bootstrap root, so the two log lines line up on the same identifier.
+fn hex8(b: &[u8]) -> String {
+    b.iter().take(8).map(|x| format!("{x:02x}")).collect()
+}
+
+/// Serve a peer-initiated request, mirroring the Java responder handlers:
+/// status → our current Status; ping/goodbye → echo; metadata → light-client
+/// zeros; light_client_* → ResourceUnavailable (no relay cache in this stage).
+fn respond_inbound(ctx: &mut SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[u8]) -> Vec<u8> {
+    let expected = protocols::expected_request_size(protocol);
+    let req_ssz: Vec<u8> = if expected == 0 {
+        Vec::new()
+    } else {
+        // `expected` is exact for every protocol we answer, so the declared
+        // length is checked before the allocation it would otherwise cause.
+        match codec::parse_request_ssz_expecting(raw, Some(expected)) {
+            Some(ssz) => ssz,
+            None => {
+                return codec::encode_error_response(
+                    codec::RESULT_INVALID_REQUEST,
+                    "InvalidRequest: unparseable body",
+                )
+            }
+        }
+    };
+
+    match protocol {
+        protocols::STATUS_V2 => {
+            let local = ctx.local_status.get();
+            codec::encode_success_response(&local.encode(), None)
+        }
+        protocols::STATUS_V1 => {
+            let local = ctx.local_status.get();
+            codec::encode_success_response(&local.encode_v1(), None)
+        }
+        // Ping answers with OUR metadata sequence number, never an echo of the
+        // caller's. Echoing is harmless for a client that dials out and closes,
+        // but a public responder that echoes tells every peer its metadata
+        // changes in lockstep with theirs — so they never refetch our real
+        // metadata, and never learn what we actually serve.
+        protocols::PING => {
+            codec::encode_success_response(&status::metadata_seq_number().to_le_bytes(), None)
+        }
+        protocols::METADATA_V2 => {
+            codec::encode_success_response(&status::metadata_v2_light_client(), None)
+        }
+        protocols::METADATA_V3 => {
+            codec::encode_success_response(&status::metadata_v3_light_client(), None)
+        }
+        // Zero chunks — write nothing, close. A light client holds no blocks
+        // and no columns, and this is how the spec says so (the root list is
+        // not even read: `expected_request_size` is 0). Not
+        // ResourceUnavailable: that is an error chunk, which Nimbus's root
+        // sync treats as a failed request and answers by ending the peer loop
+        // (see `protocols::BLOCKS_BY_ROOT`).
+        p if protocols::is_root_list_request(p) => Vec::new(),
+        // Goodbye is a one-way notification: the spec has no response for it,
+        // and the caller does not wait. We answer to keep the request_response
+        // machinery happy, and the CALLER of this function disconnects the peer
+        // — retaining someone who asked to leave is how a responder accumulates
+        // dead connections.
+        protocols::GOODBYE => {
+            let reason = if req_ssz.len() == 8 {
+                u64::from_le_bytes(req_ssz[..8].try_into().expect("length checked"))
+            } else {
+                0
+            };
+            ctx.goodbye_from.insert(peer);
+            tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer), reason,
+                "peer sent goodbye");
+            let body: &[u8] = if req_ssz.len() == 8 { &req_ssz } else { &[0u8; 8] };
+            codec::encode_success_response(body, None)
+        }
+
+        // --- light client -------------------------------------------------
+        // A serving host reads its cache; a wallet has no responder and falls
+        // through to ResourceUnavailable, exactly as before. Note there is no
+        // await point in here by construction: a miss is answered, not filled.
+        protocols::BOOTSTRAP => match (&ctx.lc, req_ssz.as_slice().try_into()) {
+            (Some(lc), Ok(root)) => {
+                let root: [u8; 32] = root;
+                let served = lc.bootstrap(&root);
+                tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
+                    root = %hex8(&root), served = served.is_some(), "light_client_bootstrap request");
+                served.unwrap_or_else(resource_unavailable)
+            }
+            (Some(_), Err(_)) => codec::encode_error_response(
+                codec::RESULT_INVALID_REQUEST,
+                "InvalidRequest: bootstrap root must be 32 bytes",
+            ),
+            (None, _) => resource_unavailable(),
+        },
+        protocols::UPDATES_BY_RANGE => match &ctx.lc {
+            Some(lc) => {
+                if req_ssz.len() != 16 {
+                    return codec::encode_error_response(
+                        codec::RESULT_INVALID_REQUEST,
+                        "InvalidRequest: updates_by_range request must be 16 bytes",
+                    );
+                }
+                let start = u64::from_le_bytes(req_ssz[..8].try_into().expect("checked"));
+                let count = u64::from_le_bytes(req_ssz[8..16].try_into().expect("checked"));
+                let served = lc.updates_by_range(start, count);
+                tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
+                    start, count, served = served.is_some(), "light_client_updates_by_range request");
+                served.unwrap_or_else(resource_unavailable)
+            }
+            None => resource_unavailable(),
+        },
+        protocols::FINALITY_UPDATE => match &ctx.lc {
+            Some(lc) => {
+                let served = lc.finality_update();
+                tracing::debug!(peer = %peer, served = served.is_some(),
+                    "light_client_finality_update request");
+                served.unwrap_or_else(resource_unavailable)
+            }
+            None => resource_unavailable(),
+        },
+        protocols::OPTIMISTIC_UPDATE => match &ctx.lc {
+            Some(lc) => {
+                let served = lc.optimistic_update();
+                tracing::debug!(peer = %peer, served = served.is_some(),
+                    "light_client_optimistic_update request");
+                served.unwrap_or_else(resource_unavailable)
+            }
+            None => resource_unavailable(),
+        },
+
+        _ => resource_unavailable(),
+    }
+}
+
+/// The address a quorum of distinct SOURCES agrees on.
+///
+/// Plurality among reports, then a floor: the winner must have at least
+/// [`EXTERNAL_ADDR_QUORUM`] distinct reporters behind it. Below that we return
+/// `None` rather than the leading candidate — "I do not know yet" is the honest
+/// answer for a server with few connections, and publishing a guess is how a
+/// record ends up pointing at an address nothing answers on.
+///
+/// # Reporters are counted by source address, not by peer id
+///
+/// A peer id is a self-minted keypair that costs nothing, so counting distinct
+/// ids would let ONE host reach quorum alone with three fresh identities —
+/// out-voting every honest reporter whenever the honest set is small, which is
+/// precisely the state just after a restart, when the answer first settles.
+/// Deduping on the address the reporter reached us from raises that cost from
+/// "generate three keypairs" to "hold three distinct addresses".
+///
+/// Honest peers behind one NAT now count once between them. That makes quorum
+/// HARDER to reach, which is the safe direction for a value that will drive a
+/// published record: the failure mode becomes "we decline to claim an address",
+/// not "we claim the wrong one".
+fn external_address(observed: &HashMap<PeerId, Observation>) -> Option<ExternalAddress> {
+    // One vote per source address. A source reporting different values across
+    // its own connections collapses to one of them, which is the point.
+    let mut by_source: HashMap<IpAddr, (IpAddr, Option<u16>)> = HashMap::new();
+    for o in observed.values() {
+        by_source.insert(o.source, (o.ip, o.port));
+    }
+    let reporters = by_source.len();
+    let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+    for (ip, _) in by_source.values() {
+        *counts.entry(*ip).or_insert(0) += 1;
+    }
+    // Ties break on the IP itself, so the answer is deterministic rather than
+    // dependent on hash iteration order — a flapping answer would look exactly
+    // like a flapping address.
+    let (ip, confirmations) = counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
+    // The port MOST reporters who back the winning IP agree on — by frequency,
+    // ties broken on the value, exactly as the IP above.
+    //
+    // `find_map` over a HashMap took whichever backer hash order happened to
+    // visit first, so when reporters disagreed (a NAT rewriting the port for
+    // some peers, or a mix of listen-port and mapped-port views) the answer
+    // flipped between calls with no change in the underlying data. That is the
+    // same failure the IP tie-break exists to prevent, and it matters more here
+    // because `dialable()` publishes this port.
+    let mut port_counts: HashMap<u16, usize> = HashMap::new();
+    for (seen, port) in by_source.values() {
+        if *seen == ip {
+            if let Some(p) = port {
+                *port_counts.entry(*p).or_insert(0) += 1;
+            }
+        }
+    }
+    let port = port_counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(p, _)| p);
+
+    (confirmations >= EXTERNAL_ADDR_QUORUM).then_some(ExternalAddress {
+        ip,
+        port,
+        confirmations,
+        reporters,
+        routable: is_routable(ip),
+    })
+}
+
+fn release_in_flight(ctx: &mut SwarmCtx, protocol: &'static str, request_id: InboundRequestId) {
+    if let Some(bytes) = ctx.in_flight.remove(&(protocol, request_id)) {
+        ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_sub(bytes);
+    }
+}
+
+/// The miss answer — "ask someone else", which is what makes a pure-cache-read
+/// handler correct rather than a shortcut.
+fn resource_unavailable() -> Vec<u8> {
+    codec::encode_error_response(codec::RESULT_RESOURCE_UNAVAILABLE, "ResourceUnavailable")
+}
+
+#[cfg(test)]
+mod external_address_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Deterministic distinct peer ids — a seeded key, not a random one, so a
+    /// failure reproduces.
+    fn peer(n: u8) -> PeerId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        let kp = libp2p::identity::Keypair::ed25519_from_bytes(seed).expect("seeded key");
+        PeerId::from(kp.public())
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(87, 154, 209, last))
+    }
+
+    /// A report from a distinct host: source address `src`, seeing us as `seen`.
+    fn obs(src: u8, seen: IpAddr) -> Observation {
+        Observation {
+            source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, src)),
+            ip: seen,
+            port: None,
+        }
+    }
+
+    #[test]
+    fn below_quorum_is_none_not_a_best_guess() {
+        let mut observed = HashMap::new();
+        for i in 0..(EXTERNAL_ADDR_QUORUM - 1) as u8 {
+            observed.insert(peer(i), obs(i, ip(161)));
+        }
+        assert_eq!(
+            external_address(&observed),
+            None,
+            "a server with too few reports genuinely does not know its own address"
+        );
+    }
+
+    #[test]
+    fn quorum_is_believed() {
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i), obs(i, ip(161)));
+        }
+        let got = external_address(&observed).unwrap();
+        assert_eq!(got.ip, ip(161));
+        assert_eq!(got.confirmations, EXTERNAL_ADDR_QUORUM);
+        assert_eq!(got.reporters, EXTERNAL_ADDR_QUORUM);
+        assert!(got.routable);
+        assert!(!got.is_contested());
+    }
+
+    #[test]
+    fn a_minority_cannot_move_the_answer() {
+        // The point of the quorum: peers claiming something else — lying, or
+        // honestly wrong behind the same NAT — must not win.
+        let mut observed = HashMap::new();
+        for i in 0..5u8 {
+            observed.insert(peer(i), obs(i, ip(161)));
+        }
+        for i in 5..7u8 {
+            observed.insert(peer(i), obs(i, ip(99)));
+        }
+        let got = external_address(&observed).unwrap();
+        assert_eq!(got.ip, ip(161));
+        assert_eq!(got.reporters, 7, "the denominator must be visible");
+        assert!(!got.is_contested(), "5 of 7 is not contested");
+    }
+
+    #[test]
+    fn one_peer_cannot_stuff_the_ballot() {
+        // Keyed by peer, so repeated reports from one peer replace rather than
+        // accumulate.
+        let mut observed = HashMap::new();
+        let loud = peer(1);
+        for _ in 0..10 {
+            observed.insert(loud, obs(1, ip(99)));
+        }
+        assert_eq!(external_address(&observed), None, "one peer is not a quorum");
+    }
+
+    #[test]
+    fn the_answer_is_deterministic_under_a_tie() {
+        // A tie resolved by hash iteration order would look exactly like a
+        // flapping address — the thing this mechanism exists to detect.
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i), obs(i, ip(1)));
+        }
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i + 50), obs(i + 50, ip(2)));
+        }
+        let first = external_address(&observed).unwrap().ip;
+        for _ in 0..20 {
+            assert_eq!(external_address(&observed).unwrap().ip, first);
+        }
+    }
+
+    #[test]
+    fn one_host_cannot_stuff_the_ballot_with_free_keypairs() {
+        // The property the ENR actually needs. A peer id is a self-minted
+        // keypair costing nothing, so counting distinct IDS would let one
+        // machine reach quorum alone — most easily right after a restart, when
+        // the honest set is smallest and the answer first settles.
+        let mut observed = HashMap::new();
+        for i in 0..10u8 {
+            // Ten identities, ONE source address.
+            observed.insert(peer(i), obs(7, ip(99)));
+        }
+        assert_eq!(
+            external_address(&observed),
+            None,
+            "ten identities behind one address are one reporter"
+        );
+    }
+
+    #[test]
+    fn a_contested_plurality_is_flagged() {
+        // 3-vs-3 must not read as an established address: one more reporter
+        // flips the winner, and that is the shape both a Sybil and a genuine
+        // mid-flight address change produce.
+        let mut observed = HashMap::new();
+        for i in 0..3u8 {
+            observed.insert(peer(i), obs(i, ip(1)));
+        }
+        for i in 3..6u8 {
+            observed.insert(peer(i), obs(i, ip(2)));
+        }
+        let got = external_address(&observed).unwrap();
+        assert_eq!(got.reporters, 6);
+        assert_eq!(got.confirmations, 3);
+        assert!(got.is_contested(), "3 of 6 is contested");
+    }
+
+    #[test]
+    fn non_routable_winners_are_labelled() {
+        // The PR's own verification established 127.0.0.1 from three loopback
+        // wallets. The realistic version is RFC1918: LAN wallets reach quorum
+        // before internet peers do.
+        for addr in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), // carrier-grade NAT
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        ] {
+            assert!(!is_routable(addr), "{addr} must not read as routable");
+        }
+        assert!(is_routable(ip(161)), "the pinned deployment's address is routable");
+        assert!(!is_routable("fd00::1".parse().unwrap()), "ULA");
+        assert!(!is_routable("fe80::1".parse().unwrap()), "link-local");
+        assert!(!is_routable("::1".parse().unwrap()), "v6 loopback");
+        assert!(is_routable("2001:db8::1".parse().unwrap()));
+
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i), obs(i, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))));
+        }
+        assert!(!external_address(&observed).unwrap().routable);
+    }
+
+    #[test]
+    fn the_port_is_carried_only_from_inbound_reports() {
+        // Inbound: the reporter dialed us, so what they see IS our externally
+        // mapped port — the fact that makes a NAT rewriting it detectable.
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(
+                peer(i),
+                Observation {
+                    source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)),
+                    ip: ip(161),
+                    port: Some(9105),
+                },
+            );
+        }
+        assert_eq!(external_address(&observed).unwrap().port, Some(9105));
+
+        // Outbound-only reports carry no port rather than an ephemeral one.
+        let mut outbound = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            outbound.insert(peer(i), obs(i, ip(161)));
+        }
+        assert_eq!(external_address(&outbound).unwrap().port, None);
+    }
+
+    #[test]
+    fn extracts_the_ip_and_ignores_the_port() {
+        // Identify reports the connection's remote address, so for a connection
+        // WE dialed the port is our ephemeral source port and says nothing about
+        // where we listen.
+        let addr: Multiaddr = "/ip4/87.154.209.161/tcp/54321".parse().unwrap();
+        assert_eq!(multiaddr_ip(&addr), Some(ip(161)));
+        let addr6: Multiaddr = "/ip6/::1/tcp/9105".parse().unwrap();
+        assert!(multiaddr_ip(&addr6).is_some());
+        let no_ip: Multiaddr = "/dns4/example.com/tcp/9105".parse().unwrap();
+        assert_eq!(multiaddr_ip(&no_ip), None);
+        assert_eq!(multiaddr_port(&addr), Some(54321));
+    }
+}
+
+#[cfg(test)]
+mod dial_resolution_tests {
+    use super::*;
+
+    fn memo() -> std::sync::Mutex<HashMap<String, Vec<IpAddr>>> {
+        std::sync::Mutex::new(HashMap::new())
+    }
+
+    /// The Lighthouse-ban regression: a peer that has subscriptions to announce
+    /// (Lighthouse always does) opens a `/meshsub/` stream toward us right after
+    /// the connection is established. If our swarm cannot negotiate it, that
+    /// peer's gossipsub emits `GossipsubNotSupported` — which Lighthouse turns
+    /// into `PeerAction::Fatal` and a 12 h ban. Here peer A plays Lighthouse
+    /// (subscribed), peer B is our wallet host (no subscriptions), and the
+    /// negotiation must complete with B recorded as a gossipsub peer.
+    #[tokio::test]
+    async fn meshsub_negotiates_without_any_subscription() {
+        // A's meter also pins the transport's counting: the TCP socket's
+        // bytes (noise handshake, muxer, gossipsub) land in its CL layer.
+        let meter_a = crate::traffic::TrafficMeter::new();
+        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Arc::clone(&meter_a))
+            .expect("swarm a");
+        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+            .expect("swarm b");
+        b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = b.select_next_some().await {
+                break address;
+            }
+        };
+        a.behaviour_mut()
+            .gossipsub
+            .subscribe(&gossipsub::IdentTopic::new(
+                "/eth2/00000000/light_client_finality_update/ssz_snappy",
+            ))
+            .unwrap();
+        a.dial(addr).unwrap();
+        let b_id = *b.local_peer_id();
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = a.select_next_some() => {
+                    if let SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                        gossipsub::Event::GossipsubNotSupported { peer_id },
+                    )) = &ev
+                    {
+                        panic!("peer {peer_id} failed /meshsub/ negotiation — this is the Lighthouse ban");
+                    }
+                    // `peer_protocol` starts every peer as Floodsub and moves it to a
+                    // Gossipsub* kind once the stream negotiated (or NotSupported).
+                    if let Some((_, kind)) =
+                        a.behaviour().gossipsub.peer_protocol().find(|(p, _)| **p == b_id)
+                    {
+                        let kind = format!("{kind:?}");
+                        assert_ne!(kind, "NotSupported");
+                        if kind.starts_with("Gossipsub") {
+                            let (rx, tx) = meter_a.cl.snapshot();
+                            assert!(rx > 0 && tx > 0, "libp2p bytes counted: rx={rx} tx={tx}");
+                            assert_eq!(meter_a.el.snapshot(), (0, 0));
+                            return;
+                        }
+                    }
+                }
+                _ = b.select_next_some() => {}
+                _ = &mut deadline => panic!("no /meshsub/ negotiation within 15 s"),
+            }
+        }
+    }
+
+    /// A peer that offers mplex and NOTHING else on TCP — Nimbus since
+    /// status-im/nimbus-eth2#6636 (2024) — with the same behaviour set as
+    /// ours. Its yamux twin below differs only in the muxer; the two stay
+    /// separate because `with_tcp`'s muxer argument fixes the builder's
+    /// phase type, so one builder cannot take the muxer as a parameter
+    /// without naming libp2p's upgrade traits.
+    fn mplex_only_peer() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p_mplex::Config::default,
+            )
+            .expect("mplex-only peer")
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    fn yamux_only_host() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .expect("yamux-only host")
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    /// A peer that speaks QUIC and nothing else — the spec's primary transport
+    /// on its own, as a client that disabled TCP would present itself.
+    fn quic_only_peer() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_quic()
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    /// Listen on `listen`, then dial from `dialer` and report whether a STREAM
+    /// worked within the deadline — the peer's Identify answer arrived (`Ok`)
+    /// — or the attempt failed/closed first (`Err(what)`). Drives both swarms.
+    ///
+    /// `ConnectionEstablished` is deliberately not the success signal:
+    /// multistream-select negotiates the muxer optimistically on the dialer
+    /// side, so a dialer with no muxer in common still reports the connection
+    /// established and only then has it closed under it — exactly the shape
+    /// the live Nimbus log showed ("Connection established" then "closed with
+    /// error ... Decode"). Only a completed stream proves a muxer was agreed.
+    async fn dial_outcome(
+        mut dialer: Swarm<Behaviour>,
+        mut peer: Swarm<Behaviour>,
+        listen: &str,
+    ) -> Result<(), String> {
+        peer.listen_on(listen.parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+                break address;
+            }
+        };
+        let peer_id = *peer.local_peer_id();
+        dialer.dial(addr).unwrap();
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = dialer.select_next_some() => match ev {
+                    SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id: p, .. },
+                    )) if p == peer_id => return Ok(()),
+                    SwarmEvent::OutgoingConnectionError { error, .. } => return Err(format!("dial failed: {error}")),
+                    SwarmEvent::ConnectionClosed { peer_id: p, cause, .. } if p == peer_id => {
+                        return Err(format!("closed: {cause:?}"))
+                    }
+                    _ => {}
+                },
+                _ = peer.select_next_some() => {}
+                _ = &mut deadline => return Err("no Identify exchange within 15 s".into()),
+            }
+        }
+    }
+
+    /// The failure that made every Nimbus node look dead to the Rust engine:
+    /// noise succeeds, then the muxer negotiation has no common protocol. Kept
+    /// as the control for the test below — if this ever passes, the peer is no
+    /// longer mplex-only and the test below proves nothing.
+    #[tokio::test]
+    async fn a_yamux_only_host_cannot_connect_to_an_mplex_only_peer() {
+        let outcome = dial_outcome(yamux_only_host(), mplex_only_peer(), "/ip4/127.0.0.1/tcp/0").await;
+        assert!(outcome.is_err(), "yamux-only host connected to an mplex-only peer: {outcome:?}");
+    }
+
+    /// The host as built offers both muxers, so an mplex-only peer (Nimbus)
+    /// is reachable: a stream completes over the connection, which is where
+    /// the yamux-only host died.
+    #[tokio::test]
+    async fn the_host_connects_to_an_mplex_only_peer_like_nimbus() {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+            .expect("swarm");
+        dial_outcome(host, mplex_only_peer(), "/ip4/127.0.0.1/tcp/0")
+            .await
+            .expect("a stream to an mplex-only peer");
+    }
+
+    /// The spec's primary transport, outbound: the host dials a peer that
+    /// listens on QUIC alone (`/udp/<port>/quic-v1`) and completes a stream —
+    /// no noise, no muxer negotiation, the TLS handshake carries the peer id.
+    #[tokio::test]
+    async fn the_host_connects_to_a_quic_only_peer() {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+            .expect("swarm");
+        dial_outcome(host, quic_only_peer(), "/ip4/127.0.0.1/udp/0/quic-v1")
+            .await
+            .expect("a stream to a QUIC-only peer");
+    }
+
+    /// …and inbound: a QUIC-only peer dials the host's QUIC listener (the
+    /// wallet's `HostConfig::default` opens one on an ephemeral port).
+    #[tokio::test]
+    async fn a_quic_only_peer_reaches_the_host() {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+            .expect("swarm");
+        dial_outcome(quic_only_peer(), host, "/ip4/127.0.0.1/udp/0/quic-v1")
+            .await
+            .expect("a stream from a QUIC-only peer");
+    }
+
+    /// The host as the production code runs it (`build_swarm`) plus the
+    /// context its event loop needs, so a test can drive `handle_swarm_event`
+    /// — responder included — against a real peer.
+    fn host_with_ctx() -> (Swarm<Behaviour>, SwarmCtx) {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+            .expect("swarm");
+        let ctx = SwarmCtx::new(
+            LocalStatus::new(StatusMessage {
+                fork_digest: [0; 4],
+                finalized_root: [0; 32],
+                finalized_epoch: 0,
+                head_root: [0; 32],
+                head_slot: 0,
+                earliest_available_slot: 0,
+            }),
+            None,
+            None,
+            // The agent map `ReqRespClient::client_of` reads (#584); nothing
+            // here asks for a client name, so an empty one.
+            Arc::default(),
+        );
+        (host, ctx)
+    }
+
+    /// One `protocol` request to the host from an mplex-only asker — the way
+    /// Nimbus asks — answered by the host's REAL event handling (responder
+    /// included). Returns the raw answer: the response wire bytes, empty for
+    /// zero chunks. Panics when the request fails, the connection closes
+    /// first, or nothing arrives within 15 s.
+    async fn ask_host_over_mplex(protocol: &'static str, request: Vec<u8>) -> Vec<u8> {
+        let (mut host, mut ctx) = host_with_ctx();
+        let mut asker = libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p_mplex::Config::default,
+            )
+            .expect("mplex-only asker")
+            .with_behaviour(|_: &libp2p::identity::Keypair| rr(protocol, ProtocolSupport::Full, RESP_TIMEOUT))
+            .expect("behaviour")
+            .build();
+        host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = host.select_next_some().await {
+                break address;
+            }
+        };
+        let host_id = *host.local_peer_id();
+        asker.dial(addr).unwrap();
+        let mut asked = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = host.select_next_some() => handle_swarm_event(&mut host, &mut ctx, ev),
+                ev = asker.select_next_some() => match ev {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_id && !asked => {
+                        asker.behaviour_mut().send_request(&host_id, request.clone());
+                        asked = true;
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message: request_response::Message::Response { response, .. }, ..
+                    }) => return response,
+                    SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => {
+                        panic!("{protocol} request failed: {error}")
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == host_id => {
+                        panic!("{protocol}: connection closed before it was answered: {cause:?}")
+                    }
+                    _ => {}
+                },
+                _ = &mut deadline => panic!("{protocol}: no answer within 15 s"),
+            }
+        }
+    }
+
+    /// What Nimbus does right after admitting a peer post-Fulu — its sync
+    /// overseer asks for `metadata/3` and nothing else, and drops the peer
+    /// if that fails ("Peer loop stopped", seen live against zbox's Nimbus
+    /// v26.9.1 with only mplex fixed: admitted, then dropped ~100 ms later,
+    /// before the bootstrap request was served). The host must answer with
+    /// the 25-byte Fulu MetaData: the v2 bytes plus `custody_group_count`.
+    #[tokio::test]
+    async fn a_nimbus_like_peer_gets_fulu_metadata_from_the_host() {
+        let response = ask_host_over_mplex(protocols::METADATA_V3, Vec::new()).await;
+        let decoded = codec::decode_response(&response, false).expect("a well-formed answer");
+        assert_eq!(decoded.result_code, codec::RESULT_SUCCESS);
+        assert_eq!(decoded.ssz_payload, status::metadata_v3_light_client());
+        assert_eq!(decoded.ssz_payload.len(), 25);
+    }
+
+    /// Nimbus's root sync, as a stand-alone asker over mplex: right after
+    /// admitting a peer it requests that peer's advertised head block by root
+    /// (seen live: `Requesting blocks by root from peer block_roots=[2008fe0e]`
+    /// — our own checkpoint — then `Blocks by root request failed reason=
+    /// BrokenConnection` and `Peer loop stopped` when the protocol was not
+    /// even offered), and one step later the data column sidecars its map
+    /// says we custody. The host must negotiate the protocol and answer with
+    /// NOTHING: zero chunks, not a success chunk and not an error.
+    #[tokio::test]
+    async fn a_blocks_by_root_request_is_answered_with_zero_chunks() {
+        // 64 roots of incompressible bytes, so the FRAMED request (the cap in
+        // `read_request` counts wire bytes, after snappy) is bigger than the
+        // cap every other request gets — a Nimbus asks for up to 32 real
+        // roots at a time, ~1 KiB of SSZ that does not compress either. The
+        // assert keeps this test honest about pinning the root-list cap.
+        let roots: Vec<u8> = (0..2048u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let request = codec::encode_request(&roots);
+        assert!(
+            request.len() > MAX_REQUEST_WIRE_BYTES,
+            "the cap pin needs a wire request over {MAX_REQUEST_WIRE_BYTES} bytes, got {}",
+            request.len()
+        );
+        zero_chunks_for(protocols::BLOCKS_BY_ROOT, request).await;
+    }
+
+    #[tokio::test]
+    async fn a_data_column_sidecars_by_root_request_is_answered_with_zero_chunks() {
+        // One DataColumnsByRootIdentifier: root + an offset to one column index.
+        let mut ident = vec![0x20u8; 32];
+        ident.extend_from_slice(&36u32.to_le_bytes()); // offset of `indices`
+        ident.extend_from_slice(&7u64.to_le_bytes()); // a single column
+        let mut list = 4u32.to_le_bytes().to_vec(); // offset of the one element
+        list.extend_from_slice(&ident);
+        zero_chunks_for(protocols::DATA_COLUMN_SIDECARS_BY_ROOT, codec::encode_request(&list)).await;
+    }
+
+    #[tokio::test]
+    async fn an_envelopes_by_root_request_is_answered_with_zero_chunks() {
+        let roots: Vec<u8> = (0..4u8).flat_map(|i| [i; 32]).collect();
+        zero_chunks_for(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, codec::encode_request(&roots)).await;
+    }
+
+    async fn zero_chunks_for(protocol: &'static str, request: Vec<u8>) {
+        let response = ask_host_over_mplex(protocol, request).await;
+        assert!(response.is_empty(), "{protocol}: expected zero chunks, got {} bytes", response.len());
+    }
+
+    /// The address order end to end, through the real client and its swarm
+    /// task: a peer known at a dead TCP address and a live QUIC one is
+    /// answered over QUIC, because `request_raw_at` moves on to the next
+    /// address when — and only when — the dial itself fails.
+    #[tokio::test]
+    async fn a_dead_tcp_address_falls_through_to_the_quic_one() {
+        let (mut peer, mut ctx) = host_with_ctx();
+        peer.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).unwrap();
+        let quic = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+                break address;
+            }
+        };
+        let peer_id = *peer.local_peer_id();
+        // The peer runs the real event loop body, responder included.
+        tokio::spawn(async move {
+            loop {
+                let ev = peer.select_next_some().await;
+                handle_swarm_event(&mut peer, &mut ctx, ev);
+            }
+        });
+
+        let status = StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot: 0,
+        };
+        let wire = codec::encode_request(&status.encode());
+        let client = start_host(LocalStatus::new(status)).expect("the wallet host");
+        // A port nothing listens on — bound and released just now — so this
+        // dial is refused at once: the shape of a TCP port a firewall closed.
+        // (Port 1 would do on most hosts, but not on one where tcpmux answers.)
+        let dead_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dead: Multiaddr = format!("/ip4/127.0.0.1/tcp/{dead_port}").parse().unwrap();
+        let answer = client
+            .request_raw_at(peer_id, vec![dead, quic], protocols::STATUS_V2, wire)
+            .await
+            .expect("answered over the second address");
+        let decoded = codec::decode_response(&answer, false).expect("a status chunk");
+        assert_eq!(decoded.result_code, codec::RESULT_SUCCESS);
+        assert_eq!(decoded.ssz_payload.len(), StatusMessage::SSZ_SIZE_V2);
+    }
+
+    /// A name-pinned QUIC address resolves the same way a TCP one does: the
+    /// `/udp/<port>/quic-v1/p2p/<id>` tail survives on every candidate.
+    #[tokio::test]
+    async fn a_name_with_a_quic_tail_resolves_keeping_the_tail() {
+        let a: Multiaddr = "/dns4/localhost/udp/9105/quic-v1/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        let out = resolve_dial_addrs(&a, &memo()).await;
+        assert!(!out.is_empty(), "localhost must resolve");
+        for m in &out {
+            assert!(multiaddr_dns_name(m).is_none(), "{m} still carries a name");
+            assert!(m.to_string().ends_with(
+                "/udp/9105/quic-v1/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            ), "{m} lost its QUIC tail");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_ip_address_passes_through_untouched() {
+        let a: Multiaddr = "/ip4/87.154.209.161/tcp/9105/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_name_becomes_concrete_candidates_keeping_port_and_peer_id() {
+        // localhost is the one name guaranteed resolvable in CI and offline.
+        let a: Multiaddr = "/dns4/localhost/tcp/9105/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        let out = resolve_dial_addrs(&a, &memo()).await;
+        assert!(!out.is_empty(), "localhost must resolve");
+        for m in &out {
+            // No DNS component survives — that is the whole point: the swarm's
+            // transport may have no DNS layer at all (Android), where a /dns4/
+            // address is rejected with "Multiaddr is not supported".
+            assert!(multiaddr_dns_name(m).is_none(), "{m} still carries a name");
+            assert!(multiaddr_ip(m).is_some(), "{m} has no IP");
+            assert_eq!(multiaddr_port(m), Some(9105), "port must survive");
+            assert!(
+                m.to_string().ends_with("16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"),
+                "peer id must survive: {m}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_name_falls_back_to_the_original() {
+        // NOT empty. `request_raw` resolves before it can know whether a dial is
+        // even needed, so returning nothing would fail requests on peers we are
+        // already connected to over a transient resolver blip. The failure is
+        // logged; a dial that genuinely needs the address fails on its own.
+        let a: Multiaddr = "/dns4/no-such-host.invalid/tcp/9105/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()]);
+    }
+
+    #[tokio::test]
+    async fn an_address_without_tcp_is_returned_untouched() {
+        // No /tcp/ means nothing to rebuild around: rewriting would drop the
+        // port, the transport and the /p2p/ id, leaving a bare /ip4/A.
+        for raw in ["/dnsaddr/example.com", "/dns4/localhost"] {
+            let a: Multiaddr = raw.parse().unwrap();
+            assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()], "{raw}");
+        }
+    }
+
+    /// The first answer is INFO, a repeat is DEBUG — the memo is what decides,
+    /// so it must actually be written on the first pass.
+    #[tokio::test]
+    async fn the_answer_is_remembered_so_repeats_can_be_quiet() {
+        let a: Multiaddr = "/dns4/localhost/tcp/9105".parse().unwrap();
+        let m = memo();
+        let first = resolve_dial_addrs(&a, &m).await;
+        assert!(!first.is_empty());
+        assert_eq!(m.lock().unwrap().len(), 1, "first resolution must be recorded");
+        let again = resolve_dial_addrs(&a, &m).await;
+        assert_eq!(first, again, "a repeat must return the same candidates");
+        assert_eq!(m.lock().unwrap().len(), 1, "and must not grow the memo");
+    }
+
+    #[tokio::test]
+    async fn duplicate_addresses_are_collapsed() {
+        // localhost commonly resolves to 127.0.0.1 twice (once per socket type);
+        // dialing the same address twice buys nothing.
+        let a: Multiaddr = "/dns4/localhost/tcp/9105".parse().unwrap();
+        let out = resolve_dial_addrs(&a, &memo()).await;
+        let ips: HashSet<_> = out.iter().filter_map(multiaddr_ip).collect();
+        assert_eq!(ips.len(), out.len(), "candidates must be unique by IP");
+    }
+}
+
+#[cfg(test)]
+mod dns_change_detection_tests {
+    use super::*;
+
+    /// A REORDER of the same addresses must not read as a change. getaddrinfo's
+    /// RFC 6724 order depends on the local network, not only on the record, so a
+    /// dual-stack host can legitimately return the same two addresses in either
+    /// order between calls — and a false ADDRESS CHANGED on the line an operator
+    /// watches for a real one is worse than the noise it replaced.
+    #[test]
+    fn a_reorder_is_not_a_change() {
+        let v6: IpAddr = "64:ff9b::579a:d1a1".parse().unwrap();
+        let v4: IpAddr = "87.154.209.161".parse().unwrap();
+        let mut a = vec![v6, v4];
+        let mut b = vec![v4, v6];
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "same set in either order must compare equal");
+    }
+
+    #[test]
+    fn a_different_address_is_a_change() {
+        let mut a = vec!["87.154.209.161".parse::<IpAddr>().unwrap()];
+        let mut b = vec!["87.154.209.162".parse::<IpAddr>().unwrap()];
+        a.sort();
+        b.sort();
+        assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod pending_request_tests {
+    //! `OutboundRequestId` is unique only PER `request_response::Behaviour`, and
+    //! this host runs one behaviour per protocol, each counting from 1. These
+    //! drive the real dispatch (`submit_request`, the auto-Status on
+    //! `ConnectionEstablished`) and the real completion (`on_rr_event`) with
+    //! colliding ids, and check that every outcome reaches whoever asked for it.
+    use super::*;
+    use libp2p::core::transport::PortUse;
+    use libp2p::core::{ConnectedPoint, Endpoint};
+    use libp2p::swarm::ConnectionId;
+    use std::num::NonZeroU32;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    fn host() -> (Swarm<Behaviour>, SwarmCtx) {
+        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+            .expect("swarm");
+        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None, Arc::default()))
+    }
+
+    fn peer() -> PeerId {
+        libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id()
+    }
+
+    fn addr() -> Multiaddr {
+        "/ip4/127.0.0.1/tcp/9000".parse().unwrap()
+    }
+
+    fn status(earliest_available_slot: u64) -> StatusMessage {
+        StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot,
+        }
+    }
+
+    /// The id every behaviour gives its FIRST request. `OutboundRequestId` has
+    /// no public constructor, so it is minted the way the host's behaviours mint
+    /// theirs — and checked to collide across two protocols, which is the
+    /// premise of every test here.
+    fn first_request_id() -> OutboundRequestId {
+        let p = peer();
+        let a = rr(protocols::BOOTSTRAP, ProtocolSupport::Full, RESP_TIMEOUT).send_request(&p, Vec::new());
+        let b = rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT).send_request(&p, Vec::new());
+        assert_eq!(a, b, "request ids no longer collide across behaviours — revisit these tests");
+        a
+    }
+
+    fn response(peer: PeerId, request_id: OutboundRequestId, bytes: &[u8]) -> RrEvent {
+        request_response::Event::Message {
+            peer,
+            connection_id: ConnectionId::new_unchecked(0),
+            message: request_response::Message::Response { request_id, response: bytes.to_vec() },
+        }
+    }
+
+    fn failure(
+        peer: PeerId,
+        request_id: OutboundRequestId,
+        error: request_response::OutboundFailure,
+    ) -> RrEvent {
+        request_response::Event::OutboundFailure {
+            peer,
+            connection_id: ConnectionId::new_unchecked(0),
+            request_id,
+            error,
+        }
+    }
+
+    fn dialer() -> ConnectedPoint {
+        ConnectedPoint::Dialer { address: addr(), role_override: Endpoint::Dialer, port_use: PortUse::Reuse }
+    }
+
+    /// A new connection, which is what starts a peer's auto-Status.
+    fn connect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
+        let event = SwarmEvent::ConnectionEstablished {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: dialer(),
+            num_established: NonZeroU32::MIN,
+            concurrent_dial_errors: None,
+            established_in: Duration::ZERO,
+        };
+        handle_swarm_event(swarm, ctx, event);
+    }
+
+    /// The peer's LAST connection closing.
+    fn disconnect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
+        let event = SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: dialer(),
+            num_established: 0,
+            cause: None,
+        };
+        handle_swarm_event(swarm, ctx, event);
+    }
+
+    /// The `client=` label a log line prints for a peer: `?` until Identify
+    /// names the agent, the agent while connected, `?` again once the last
+    /// connection closes (the map is bounded by the connected set) — and the
+    /// Goodbye bookkeeping that tells a drop from an announced leave is
+    /// cleared by that same close.
+    #[tokio::test]
+    async fn client_label_follows_identify_goodbye_and_the_last_close() {
+        let agents: AgentMap = Arc::default();
+        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+            .expect("swarm");
+        let mut ctx = SwarmCtx::new(LocalStatus::new(status(0)), None, None, agents.clone());
+        let client = ReqRespClient { tx: mpsc::channel(1).0, agents: agents.clone(), last_resolved: Arc::default() };
+        let key = libp2p::identity::Keypair::generate_secp256k1();
+        let p = key.public().to_peer_id();
+
+        connect(&mut swarm, &mut ctx, p);
+        assert_eq!(client.client_of(&p), "?", "before Identify");
+
+        handle_behaviour_event(&mut swarm, &mut ctx, BehaviourEvent::Identify(identify::Event::Received {
+            connection_id: ConnectionId::new_unchecked(1),
+            peer_id: p,
+            info: identify::Info {
+                public_key: key.public(),
+                protocol_version: "eth2/1.0.0".into(),
+                // Peer-chosen text: a forged log line and a terminal escape
+                // must not survive into the label (`el::pool::log_client_id`).
+                agent_version: "nimbus-eth2/v26.7.0\n INFO forged=1\x1b[31m".into(),
+                listen_addrs: Vec::new(),
+                protocols: Vec::new(),
+                observed_addr: addr(),
+                signed_peer_record: None,
+            },
+        }));
+        let shown = "nimbus-eth2/v26.7.0 INFO forged=1[31m";
+        assert_eq!(client.client_of(&p), shown, "after Identify, sanitized");
+        assert_eq!(client_label(&ctx.peer_agents, &p), shown, "swarm side sees the same map");
+
+        respond_inbound(&mut ctx, protocols::GOODBYE, p, &codec::encode_request(&129u64.to_le_bytes()));
+        assert!(ctx.goodbye_from.contains(&p), "an inbound Goodbye marks the peer as having announced its leave");
+
+        disconnect(&mut swarm, &mut ctx, p);
+        assert_eq!(client.client_of(&p), "?", "the last close forgets the agent");
+        assert!(!ctx.goodbye_from.contains(&p), "…and the Goodbye mark with it");
+    }
+
+    /// The INFO line for a peer that dropped us fires for a remote-side close
+    /// (an I/O cause) of a Status-settled peer that sent no Goodbye — and for
+    /// nothing else: not a Goodbye'd close, not a keep-alive expiry, not a
+    /// close we made ourselves, not a peer that never settled Status.
+    #[test]
+    fn remote_drop_without_goodbye_is_the_only_info_case() {
+        use libp2p::swarm::ConnectionError;
+        let io = || Some(ConnectionError::IO(io::Error::new(io::ErrorKind::ConnectionReset, "reset")));
+        assert!(remote_drop_without_goodbye(&io(), true, false).is_some());
+        assert!(remote_drop_without_goodbye(&io(), true, true).is_none(), "announced leave");
+        assert!(remote_drop_without_goodbye(&io(), false, false).is_none(), "Status never settled");
+        let idle = Some(ConnectionError::KeepAliveTimeout);
+        assert!(remote_drop_without_goodbye(&idle, true, false).is_none(), "keep-alive expiry");
+        assert!(remote_drop_without_goodbye(&None, true, false).is_none(), "closed locally");
+    }
+
+    /// Two protocols' first requests in flight together carry the same id. Keyed
+    /// on the id alone, the second insert dropped the first caller's reply
+    /// channel — which a caller sees as "service shut down" — and the bootstrap
+    /// response was handed to the finality caller.
+    #[tokio::test]
+    async fn first_requests_on_two_protocols_reach_their_own_callers() {
+        let (mut swarm, mut ctx) = host();
+        let p = peer();
+        let id = first_request_id();
+        ctx.status_done.insert(p); // an established peer: both dispatch at once
+        let (boot_tx, mut boot_rx) = oneshot::channel();
+        let (fin_tx, mut fin_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, p, None, vec![addr()], protocols::BOOTSTRAP, vec![1], boot_tx);
+        submit_request(&mut swarm, &mut ctx, p, None, vec![addr()], protocols::FINALITY_UPDATE, Vec::new(), fin_tx);
+
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(p, id, b"bootstrap"));
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::FINALITY_UPDATE,
+            failure(p, id, request_response::OutboundFailure::Timeout),
+        );
+
+        assert_eq!(
+            boot_rx.try_recv(),
+            Ok(Ok(b"bootstrap".to_vec())),
+            "the bootstrap caller must get the bootstrap response"
+        );
+        assert_eq!(
+            fin_rx.try_recv(),
+            Ok(Err(RequestError::Timeout)),
+            "the finality caller must get its own outcome"
+        );
+        assert!(ctx.pending.is_empty(), "each outcome consumes its own entry");
+    }
+
+    /// The race the sync loop's fan-out produces: B connects while a bootstrap
+    /// to A is outstanding, so B's auto-Status and A's bootstrap are both id 1.
+    /// Keyed on the id alone, A was handed B's Status bytes as a successful
+    /// bootstrap (undecodable, so A gets struck) and B never settled, stranding
+    /// the request parked behind B's Status.
+    #[tokio::test]
+    async fn auto_status_and_a_request_to_another_peer_settle_independently() {
+        let (mut swarm, mut ctx) = host();
+        let (a, b) = (peer(), peer());
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        let (parked_tx, mut parked_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![1], parked_tx);
+        assert!(ctx.queued.contains_key(&b), "B's request waits for B's Status");
+
+        ctx.status_done.insert(a);
+        let (a_tx, mut a_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, a, None, vec![addr()], protocols::BOOTSTRAP, vec![2], a_tx);
+
+        let b_status = codec::encode_success_response(&status(4242).encode(), None);
+        on_rr_event(&mut swarm, &mut ctx, protocols::STATUS_V2, response(b, id, &b_status));
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(a, id, b"bootstrap"));
+
+        assert_eq!(
+            a_rx.try_recv(),
+            Ok(Ok(b"bootstrap".to_vec())),
+            "A must get A's bootstrap, not B's Status"
+        );
+        assert!(ctx.status_done.contains(&b), "B's Status reply must settle B");
+        assert_eq!(ctx.peer_earliest.get(&b), Some(&4242), "and be read as B's Status");
+        assert!(!ctx.queued.contains_key(&b), "settling B releases its parked request");
+        assert_eq!(parked_rx.try_recv(), Err(TryRecvError::Empty), "released into flight, not dropped");
+        assert_eq!(ctx.pending.len(), 1, "B's released request is the only one outstanding");
+    }
+
+    /// A v1-only peer refusing status/2 while another peer's first bootstrap is
+    /// out: the refusal must start THAT peer's v1 fallback, never reach the
+    /// bootstrap caller as UnsupportedProtocol, and the v1 reply — id 1 on a
+    /// third behaviour — must settle the peer.
+    #[tokio::test]
+    async fn a_status_v2_refusal_falls_back_for_that_peer_only() {
+        let (mut swarm, mut ctx) = host();
+        let (a, b) = (peer(), peer());
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        ctx.status_done.insert(a);
+        let (a_tx, mut a_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, a, None, vec![addr()], protocols::BOOTSTRAP, vec![1], a_tx);
+
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::STATUS_V2,
+            failure(b, id, request_response::OutboundFailure::UnsupportedProtocols),
+        );
+        assert_eq!(a_rx.try_recv(), Err(TryRecvError::Empty), "B's refusal is not A's outcome");
+
+        let b_status = codec::encode_success_response(&status(0).encode_v1(), None);
+        on_rr_event(&mut swarm, &mut ctx, protocols::STATUS_V1, response(b, id, &b_status));
+        assert!(ctx.status_done.contains(&b), "B's v1 reply must settle B");
+        assert_eq!(ctx.peer_earliest.get(&b), Some(&0), "a v1 peer reports history from genesis");
+
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(a, id, b"bootstrap"));
+        assert_eq!(a_rx.try_recv(), Ok(Ok(b"bootstrap".to_vec())));
+        assert!(ctx.pending.is_empty());
+    }
+
+    /// libp2p yields a peer's last `ConnectionClosed` BEFORE the `OutboundFailure`
+    /// of the auto-Status in flight on it: the behaviour queues the failure while
+    /// handling the close, and it surfaces on a later poll. That late failure must
+    /// not settle the peer. A disconnected peer marked Status-done sends whatever
+    /// was parked since the close, and every request after it, ahead of the next
+    /// connection's own auto-Status — the ordering the parking exists to prevent.
+    #[tokio::test]
+    async fn a_late_auto_status_failure_does_not_settle_a_disconnected_peer() {
+        let (mut swarm, mut ctx) = host();
+        let b = peer();
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        disconnect(&mut swarm, &mut ctx, b);
+        let (early_tx, mut early_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![1], early_tx);
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::STATUS_V2,
+            failure(b, id, request_response::OutboundFailure::ConnectionClosed),
+        );
+        assert!(!ctx.status_done.contains(&b), "a disconnected peer is never Status-done");
+        assert!(ctx.pending.is_empty(), "the request parked since the close stays parked");
+
+        connect(&mut swarm, &mut ctx, b); // the reconnect sends its own auto-Status
+        let (late_tx, mut late_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![2], late_tx);
+        assert_eq!(ctx.queued.get(&b).map(Vec::len), Some(2), "both wait for the new Status");
+        assert_eq!(ctx.pending.len(), 1, "only the new auto-Status is in flight");
+        assert_eq!(early_rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(late_rx.try_recv(), Err(TryRecvError::Empty));
+    }
+}

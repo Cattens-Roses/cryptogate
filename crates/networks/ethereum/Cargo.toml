@@ -1,0 +1,23 @@
+[package]
+name = "network-ethereum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wallet-core = { path = "../../wallet-core" }
+anyhow.workspace = true
+bitcoin.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+hmac = "0.12"
+sha2 = "0.10"
+zeroize.workspace = true
+myotis-net = { path = "../../../vendor/myotis-net" }
+myotis-core = { git = "https://github.com/biafra23/myotis", rev = "23c0bcb27c332d38a2cf9f95e9e7cd98dae292a9" }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+bip39 = "2.2"
