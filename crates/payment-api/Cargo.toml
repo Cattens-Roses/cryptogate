@@ -29,3 +29,4 @@ clap = { version = "4.6", features = ["derive"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

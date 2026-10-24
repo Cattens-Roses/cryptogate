@@ -20,8 +20,21 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/create/{currency}", post(create))
         .route("/api/status/{id}", get(status))
         .route("/api/payend/{id}", post(payend))
-        .route("/health", get(|| async { Json(serde_json::json!({"ok": true})) }))
+        .route("/health", get(health))
         .with_state(AppState { engine })
+}
+
+async fn health(State(state): State<AppState>) -> Response {
+    let ok = state.engine.healthy();
+    (
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(serde_json::json!({"ok": ok})),
+    )
+        .into_response()
 }
 
 fn api_key<'a>(headers: &'a HeaderMap, query: &'a StatusQuery) -> Option<&'a str> {
@@ -68,7 +81,13 @@ async fn create(
             Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
         },
     };
-    match state.engine.create_invoice(&currency, expected) {
+    let result =
+        tokio::task::spawn_blocking(move || state.engine.create_invoice(&currency, expected)).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "invoice worker failed"),
+    };
+    match result {
         Ok(invoice) => (
             StatusCode::CREATED,
             Json(invoice_json(
@@ -111,7 +130,12 @@ async fn payend(
     if !state.engine.check_api_key(api_key(&headers, &query)) {
         return err(StatusCode::UNAUTHORIZED, "invalid api key");
     }
-    match state.engine.payend(&id) {
+    let result = tokio::task::spawn_blocking(move || state.engine.payend(&id)).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "invoice worker failed"),
+    };
+    match result {
         Ok(invoice) => Json(invoice_json(
             &invoice,
             decimals_for(&invoice.currency),
@@ -132,4 +156,70 @@ async fn payend(
 
 fn err(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    async fn request(
+        app: Router,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().method(method).uri(path);
+        if let Some(key) = key {
+            request = request.header("X-Api-Key", key);
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let code = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (code, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn http_auth_large_eth_amounts_idempotent_close_and_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(crate::engine::tests::config(dir.path())).unwrap();
+        let app = router(Arc::clone(&engine));
+        let (code, _) = request(app.clone(), "POST", "/api/create/eth?amount=20", None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, invoice) = request(
+            app.clone(),
+            "POST",
+            "/api/create/eth?amount=20",
+            Some("test-api-key"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(invoice["expected_amount_raw"], "20000000000000000000");
+        assert_eq!(invoice["payment_complete"], false);
+        let path = format!("/api/payend/{}", invoice["id"].as_str().unwrap());
+        for _ in 0..2 {
+            let (code, invoice) = request(app.clone(), "POST", &path, Some("test-api-key")).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(invoice["window_closed"], true);
+        }
+        let (code, _) = request(
+            app.clone(),
+            "GET",
+            "/api/status/unknown",
+            Some("test-api-key"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        engine.stop(); // also drops Ethereum's nested runtime safely
+        let (code, health) = request(app, "GET", "/health", None).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health["ok"], false);
+    }
 }

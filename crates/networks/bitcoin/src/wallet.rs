@@ -125,6 +125,7 @@ pub struct Bitcoin {
     confirmed_ids: BTreeSet<Txid>,
     confirmed_spends: BTreeSet<OutPoint>,
     prepared: Option<Payment>,
+    active_scripts: Option<BTreeSet<ScriptBuf>>,
 }
 
 impl Bitcoin {
@@ -220,6 +221,7 @@ impl Bitcoin {
             confirmed_ids: BTreeSet::new(),
             confirmed_spends: BTreeSet::new(),
             prepared: None,
+            active_scripts: None,
         };
         wallet.refresh_scripts()?;
         wallet.reconcile()?;
@@ -443,6 +445,7 @@ impl Bitcoin {
         let scripts: Vec<_> = self
             .scripts
             .keys()
+            .filter(|script| self.watches_script(script))
             .map(|script| script.as_bytes())
             .collect();
         let batch = self
@@ -566,8 +569,19 @@ impl Bitcoin {
         Ok(())
     }
 
+    fn watches_script(&self, script: &ScriptBuf) -> bool {
+        self.active_scripts
+            .as_ref()
+            .is_none_or(|scripts| scripts.contains(script))
+    }
+
     fn mempool_watch(&self) -> Watch {
-        let mut outpoints: BTreeSet<_> = self.coins.keys().copied().collect();
+        let mut outpoints: BTreeSet<_> = self
+            .coins
+            .values()
+            .filter(|coin| self.watches_script(&coin.output.script_pubkey))
+            .map(|coin| coin.outpoint)
+            .collect();
         for raw in self
             .state
             .pending
@@ -577,7 +591,9 @@ impl Bitcoin {
         {
             if let Some(tx) = decode_transaction(raw) {
                 for (vout, output) in tx.output.iter().enumerate() {
-                    if self.scripts.contains_key(&output.script_pubkey) {
+                    if self.scripts.contains_key(&output.script_pubkey)
+                        && self.watches_script(&output.script_pubkey)
+                    {
                         outpoints.insert(OutPoint {
                             txid: tx.compute_txid(),
                             vout: vout as u32,
@@ -587,7 +603,12 @@ impl Bitcoin {
             }
         }
         Watch {
-            scripts: self.scripts.keys().cloned().collect(),
+            scripts: self
+                .scripts
+                .keys()
+                .filter(|script| self.watches_script(script))
+                .cloned()
+                .collect(),
             outpoints,
         }
     }
@@ -834,7 +855,8 @@ impl Bitcoin {
             let vbytes = 12 + selected.len() as u64 * 69 + 9 + destination.len() as u64;
             fee = vbytes.checked_mul(fee_rate).context("Fee overflow")?;
             ensure!(
-                !selected.is_empty() && total == amount.checked_add(fee).context("Payment overflow")?,
+                !selected.is_empty()
+                    && total == amount.checked_add(fee).context("Payment overflow")?,
                 "Sweep amount does not match selected coins"
             );
         } else {
@@ -921,6 +943,25 @@ impl Bitcoin {
     }
 }
 
+impl Bitcoin {
+    fn relay_signed(&mut self, payment: &Payment, cancel: &AtomicBool) -> Result<()> {
+        let peer = self.peers.first_mut().context("No peer")?;
+        peer.send("tx", &payment.raw)?;
+        let nonce: u64 = rand::random();
+        peer.send("ping", &nonce.to_le_bytes())?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let message = peer.receive_until(cancel, deadline)?;
+            match message.command.as_str() {
+                "pong" if message.payload == nonce.to_le_bytes() => return Ok(()),
+                "ping" => peer.pong(&message.payload)?,
+                "reject" => bail!("Peer rejected a message after broadcast; inputs remain reserved until resolved"),
+                _ => {}
+            }
+        }
+    }
+}
+
 impl Network for Bitcoin {
     fn info(&self) -> NetworkInfo {
         NetworkInfo {
@@ -977,7 +1018,11 @@ impl Network for Bitcoin {
             address: address::derive(&self.master, false, self.state.receive_index)
                 .map(|d| d.2)
                 .unwrap_or_default(),
-            balance: self.coins.values().map(|c| u128::from(c.output.value.to_sat())).sum(),
+            balance: self
+                .coins
+                .values()
+                .map(|c| u128::from(c.output.value.to_sat()))
+                .sum(),
             spendable: self
                 .coins
                 .values()
@@ -993,6 +1038,24 @@ impl Network for Bitcoin {
             peer: peers.first().map(|p| p.0.to_string()).unwrap_or_default(),
             transactions,
         }
+    }
+
+    fn set_active_addresses(&mut self, addresses: &[String]) -> Result<()> {
+        let scripts: BTreeSet<_> = addresses
+            .iter()
+            .map(|text| address::script_for_address(text))
+            .collect::<Result<_>>()?;
+        ensure!(
+            scripts
+                .iter()
+                .all(|script| self.scripts.contains_key(script)),
+            "Active invoice does not belong to this wallet"
+        );
+        if self.active_scripts.as_ref() != Some(&scripts) {
+            self.active_scripts = Some(scripts);
+            self.update_mempool_watch();
+        }
+        Ok(())
     }
 
     fn next_address(&mut self) -> Result<String> {
@@ -1200,28 +1263,77 @@ impl Network for Bitcoin {
         balances.into_iter().collect()
     }
 
+    fn address_credited(&self, address: &str) -> Option<u128> {
+        let script = address::script_for_address(address).ok()?;
+        let mut seen = BTreeSet::new();
+        let mut total = 0;
+        for record in &self.state.records {
+            for raw in &record.transactions {
+                let Some(tx) = decode_transaction(raw) else {
+                    continue;
+                };
+                let txid = tx.compute_txid();
+                let depth = self.chain.height().saturating_sub(record.height) + 1;
+                if !self.confirmed_ids.contains(&txid)
+                    || depth < if tx.is_coinbase() { 100 } else { 6 }
+                    || !seen.insert(txid)
+                {
+                    continue;
+                }
+                total += tx
+                    .output
+                    .iter()
+                    .filter(|output| output.script_pubkey == script)
+                    .map(|output| u128::from(output.value.to_sat()))
+                    .sum::<u128>();
+            }
+        }
+        Some(total)
+    }
+
+    fn address_received(&self, address: &str) -> Option<u128> {
+        Some(
+            self.address_transactions(address)
+                .iter()
+                .filter(|tx| tx.confirmed)
+                .map(|tx| tx.amount)
+                .sum(),
+        )
+    }
+
     fn address_transactions(&self, address: &str) -> Vec<AddressTransaction> {
         let mut by_txid = BTreeMap::<String, AddressTransaction>::new();
-        for coin in self.coins.values() {
-            if coin.change {
-                continue;
+        let Ok(script) = address::script_for_address(address) else {
+            return Vec::new();
+        };
+        // Deposits remain deposits after a sweep spends their outputs.
+        for record in &self.state.records {
+            for raw in &record.transactions {
+                let Some(tx) = decode_transaction(raw) else {
+                    continue;
+                };
+                let txid = tx.compute_txid();
+                if !self.confirmed_ids.contains(&txid) {
+                    continue;
+                }
+                let amount = tx
+                    .output
+                    .iter()
+                    .filter(|output| output.script_pubkey == script)
+                    .map(|output| u128::from(output.value.to_sat()))
+                    .sum();
+                if amount > 0 {
+                    by_txid.insert(
+                        txid.to_string(),
+                        AddressTransaction {
+                            txid: txid.to_string(),
+                            amount,
+                            confirmed: true,
+                            height: record.height,
+                        },
+                    );
+                }
             }
-            let Ok((_, _, coin_address)) = address::derive(&self.master, false, coin.index) else {
-                continue;
-            };
-            if coin_address != address {
-                continue;
-            }
-            let txid = coin.outpoint.txid.to_string();
-            let entry = by_txid.entry(txid.clone()).or_insert(AddressTransaction {
-                txid,
-                amount: 0,
-                confirmed: true,
-                height: coin.height,
-            });
-            entry.amount += u128::from(coin.output.value.to_sat());
-            entry.confirmed = true;
-            entry.height = coin.height;
         }
         for raw in self
             .state
@@ -1308,7 +1420,9 @@ impl Network for Bitcoin {
         let destination = address::script_for_address(recipient)?;
         let vbytes = 12 + available.len() as u64 * 69 + 9 + destination.len() as u64;
         let fee = vbytes.checked_mul(fee_rate).context("Fee overflow")?;
-        let amount = total.checked_sub(fee).context("Invoice funds cannot cover the fee")?;
+        let amount = total
+            .checked_sub(fee)
+            .context("Invoice funds cannot cover the fee")?;
         ensure!(amount >= DUST, "Forward amount is below dust after fees");
         self.sign_payment(recipient, amount, fee_rate, available, true)
     }
@@ -1359,20 +1473,97 @@ impl Network for Bitcoin {
         }
         self.save()?;
         self.prepared = None;
-        let peer = self.peers.first_mut().context("No peer")?;
-        peer.send("tx", &payment.raw)?;
-        let nonce: u64 = rand::random();
-        peer.send("ping", &nonce.to_le_bytes())?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let message = peer.receive_until(cancel, deadline)?;
-            match message.command.as_str() {
-                "pong" if message.payload == nonce.to_le_bytes() => return Ok(()),
-                "ping" => peer.pong(&message.payload)?,
-                "reject" => bail!("Peer rejected a message after broadcast; inputs remain reserved until resolved"),
-                _ => {}
+        self.relay_signed(payment, cancel)
+    }
+
+    fn saved_payment(&self, txid: &str, recipient: &str) -> Option<Payment> {
+        let script = address::script_for_address(recipient).ok()?;
+        for raw in &self.state.pending {
+            let tx = decode_transaction(raw)?;
+            if tx.compute_txid().to_string() != txid
+                || tx.output.len() != 1
+                || tx.output[0].script_pubkey != script
+            {
+                continue;
             }
+            let amount = u128::from(tx.output[0].value.to_sat());
+            let debit = self
+                .history
+                .iter()
+                .find(|entry| entry.txid == txid && entry.height > 0)
+                .map(|entry| entry.sent)
+                .or_else(|| {
+                    tx.input.iter().try_fold(0u128, |sum, input| {
+                        sum.checked_add(u128::from(
+                            self.coins
+                                .get(&input.previous_output)?
+                                .output
+                                .value
+                                .to_sat(),
+                        ))
+                    })
+                })?;
+            return Some(Payment {
+                recipient: recipient.into(),
+                amount,
+                fee: debit.checked_sub(amount)?,
+                txid: txid.into(),
+                raw: hex::decode(raw).ok()?,
+            });
         }
+        None
+    }
+
+    fn resume_broadcast(&mut self, payment: &Payment, cancel: &AtomicBool) -> Result<()> {
+        let tx: Transaction = deserialize(&payment.raw)?;
+        ensure!(
+            tx.compute_txid().to_string() == payment.txid,
+            "Stored payment txid mismatch"
+        );
+        ensure!(
+            tx.output.len() == 1
+                && u128::from(tx.output[0].value.to_sat()) == payment.amount
+                && tx.output[0].script_pubkey == address::script_for_address(&payment.recipient)?,
+            "Stored sweep does not match recipient/amount"
+        );
+        if self.state.pending.contains(&hex::encode(&payment.raw)) {
+            self.connect(cancel)?;
+            return self.relay_signed(payment, cancel);
+        }
+        // Crash between gateway journal persistence and wallet reservation.
+        // Recover only a sweep whose signatures verify against our own coins.
+        for (index, input) in tx.input.iter().enumerate() {
+            let coin = self
+                .coins
+                .get(&input.previous_output)
+                .context("Stored sweep input is unavailable")?;
+            let key = address::derive(&self.master, coin.change, coin.index)?.0;
+            let public = bitcoin::secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &key);
+            let witness: Vec<_> = input.witness.iter().collect();
+            ensure!(
+                witness.len() == 2
+                    && witness[1] == public.serialize()
+                    && witness[0].last() == Some(&1),
+                "Invalid stored sweep witness"
+            );
+            let signature = bitcoin::secp256k1::ecdsa::Signature::from_der(
+                &witness[0][..witness[0].len() - 1],
+            )?;
+            let digest = SighashCache::new(&tx).p2wpkh_signature_hash(
+                index,
+                &coin.output.script_pubkey,
+                coin.output.value,
+                EcdsaSighashType::All,
+            )?;
+            Secp256k1::verification_only().verify_ecdsa(
+                &Message::from_digest(digest.to_byte_array()),
+                &signature,
+                &public,
+            )?;
+        }
+        ensure!(!tx.input.is_empty(), "Stored sweep has no inputs");
+        self.prepared = Some(payment.clone());
+        self.broadcast(payment, cancel)
     }
 }
 
@@ -1686,10 +1877,10 @@ mod tests {
         let tx: Transaction = deserialize(&payment.raw).unwrap();
         assert_eq!(tx.compute_txid().to_string(), payment.txid);
         assert_eq!(
-            tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>() + payment.fee,
+            u128::from(tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>()) + payment.fee,
             500_000
         );
-        assert!(payment.fee >= tx.vsize() as u64 * 2);
+        assert!(payment.fee >= tx.vsize() as u128 * 2);
         let items: Vec<&[u8]> = tx.input[0].witness.iter().collect();
         let signature =
             bitcoin::secp256k1::ecdsa::Signature::from_der(&items[0][..items[0].len() - 1])
@@ -1718,6 +1909,95 @@ mod tests {
             serde_json::from_slice(&fs::read(&wallet.state_path).unwrap()).unwrap();
         assert_eq!(persisted.pending, vec![hex::encode(&payment.raw)]);
         assert!(wallet.broadcast(&payment, &cancel).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn gateway_scope_excludes_retired_addresses_from_filter_and_relay_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = Bitcoin::open(
+            &[7; 64],
+            dir.path(),
+            Options::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let first = wallet.next_address().unwrap();
+        let second = wallet.next_address().unwrap();
+        let first_script = address::script_for_address(&first).unwrap();
+        let second_script = address::script_for_address(&second).unwrap();
+        wallet.set_active_addresses(&[first]).unwrap();
+        assert!(wallet.watches_script(&first_script));
+        assert!(!wallet.watches_script(&second_script));
+        wallet.set_active_addresses(&[second]).unwrap();
+        assert!(!wallet.watches_script(&first_script));
+        assert!(!wallet.mempool_watch().scripts.contains(&first_script));
+        assert!(wallet.mempool_watch().scripts.contains(&second_script));
+    }
+
+    #[test]
+    fn gateway_sweep_resumes_journaled_payment_and_relay_is_idempotent() {
+        let (peer_address, server) = crate::peer::mock_peer(|mut peer| {
+            let cancel = AtomicBool::new(false);
+            let mut first = None;
+            for _ in 0..2 {
+                let message = peer.receive(&cancel).unwrap();
+                assert_eq!(message.command, "tx");
+                if let Some(raw) = &first {
+                    assert_eq!(&message.payload, raw);
+                } else {
+                    first = Some(message.payload.clone());
+                }
+                let ping = peer.receive(&cancel).unwrap();
+                assert_eq!(ping.command, "ping");
+                peer.send("pong", &ping.payload).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut wallet = Bitcoin::open(
+            &[7; 64],
+            dir.path(),
+            Options {
+                peer: Some(peer_address),
+                birthday: Some(1),
+                ..Options::default()
+            },
+            &cancel,
+        )
+        .unwrap();
+        wallet.chain.signing_test_chain();
+        wallet.state.scanned = 6;
+        let (_, script, sender) = address::derive(&wallet.master, false, 0).unwrap();
+        let recipient = address::derive(&wallet.master, false, 1).unwrap().2;
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([42; 32]),
+            vout: 0,
+        };
+        wallet.coins.insert(
+            outpoint,
+            Coin {
+                outpoint,
+                output: TxOut {
+                    value: Amount::from_sat(500_000),
+                    script_pubkey: script,
+                },
+                height: 1,
+                coinbase: false,
+                change: false,
+                index: 0,
+            },
+        );
+        let payment = wallet.prepare_forward(&sender, &recipient, 2).unwrap();
+        wallet.prepared = None; // crash after gateway journal, before wallet reservation
+        wallet.resume_broadcast(&payment, &cancel).unwrap();
+        assert_eq!(wallet.state.pending.len(), 1);
+        wallet.resume_broadcast(&payment, &cancel).unwrap();
+        assert_eq!(wallet.state.pending.len(), 1);
+        let mut tampered = payment.clone();
+        tampered.amount += 1;
+        assert!(wallet.resume_broadcast(&tampered, &cancel).is_err());
+        assert!(wallet.prepare_forward(&sender, &recipient, 2).is_err());
         server.join().unwrap();
     }
 
@@ -1820,6 +2100,13 @@ mod tests {
         assert_eq!(wallet.history.len(), 2);
         wallet.rebuild().unwrap();
         assert_eq!(wallet.snapshot().balance, 200_000);
+        let received_address = address::derive(&wallet.master, false, 19).unwrap().2;
+        assert_eq!(wallet.address_received(&received_address), Some(100_000));
+        assert_eq!(wallet.address_credited(&received_address), Some(0));
+        // Spending a deposit must not erase the invoice's incoming history.
+        wallet.coins.clear();
+        assert_eq!(wallet.address_received(&received_address), Some(100_000));
+        assert_eq!(wallet.address_transactions(&received_address).len(), 1);
         server.join().unwrap();
     }
 

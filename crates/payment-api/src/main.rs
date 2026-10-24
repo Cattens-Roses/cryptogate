@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version, about = "EngineCore payment API — shared SPV scan per currency, idle until invoices exist")]
+#[command(
+    version,
+    about = "EngineCore payment API — shared SPV scan per currency, idle until invoices exist"
+)]
 struct Args {
     /// Path to config.json (see config.example.json).
     #[arg(long, default_value = "config.json")]
@@ -27,16 +30,17 @@ async fn main() -> Result<()> {
     let config = config::Config::load(&args.config)?;
     let listen = config.listen.clone();
     let engine = engine::Engine::open(config)?;
-    engine.spawn_workers();
     let app = api::router(engine.clone());
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
     tracing::info!(%listen, "payment API listening · chains stay idle until /api/create/<currency>");
-    axum::serve(listener, app)
+    engine.spawn_workers();
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
-        .await?;
+        .await;
     engine.stop();
+    result?;
     Ok(())
 }
 

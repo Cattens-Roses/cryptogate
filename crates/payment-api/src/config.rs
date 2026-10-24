@@ -46,28 +46,70 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
-        ensure!(!self.api_key.is_empty() && self.api_key != "change-me-to-a-long-random-secret", "Set a real api_key in config.json");
-        ensure!(self.vault_password.chars().count() >= 10, "vault_password must be at least 10 characters");
-        ensure!(self.idle_disconnect_secs >= 30, "idle_disconnect_secs must be at least 30");
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.api_key.is_empty() && self.api_key != "change-me-to-a-long-random-secret",
+            "Set a real api_key in config.json"
+        );
+        ensure!(
+            self.vault_password.chars().count() >= 10,
+            "vault_password must be at least 10 characters"
+        );
+        ensure!(
+            self.idle_disconnect_secs >= 30,
+            "idle_disconnect_secs must be at least 30"
+        );
         ensure!(
             (60..=86_400).contains(&self.max_payment_secs),
             "max_payment_secs must be 60–86400"
         );
         let enabled: Vec<_> = self.networks.iter().filter(|(_, n)| n.enabled).collect();
-        ensure!(!enabled.is_empty(), "Enable at least one network in config.json");
+        ensure!(
+            !enabled.is_empty(),
+            "Enable at least one network in config.json"
+        );
         for (id, network) in &self.networks {
-            let id = id.to_ascii_lowercase();
-            ensure!(matches!(id.as_str(), "ltc" | "btc" | "eth"), "Unknown network `{id}`");
+            ensure!(
+                id == &id.to_ascii_lowercase(),
+                "Network keys must be lowercase: {id}"
+            );
+            ensure!(
+                matches!(id.as_str(), "ltc" | "btc" | "eth"),
+                "Unknown network `{id}`"
+            );
             if !network.enabled {
                 continue;
             }
-            ensure!(!network.payout_address.is_empty(), "networks.{id}.payout_address is required when enabled");
-            ensure!((1..=32).contains(&network.max_peers), "networks.{id}.max_peers must be 1–32");
+            ensure!(
+                !network.payout_address.is_empty(),
+                "networks.{id}.payout_address is required when enabled"
+            );
             match id.as_str() {
-                "ltc" | "btc" => ensure!((1..=1000).contains(&network.fee_rate), "UTXO fee_rate must be 1–1000"),
+                "btc" => {
+                    network_bitcoin::address::script_for_address(&network.payout_address)?;
+                }
+                "ltc" => {
+                    network_litecoin::address::script_for_address(&network.payout_address)?;
+                }
                 "eth" => {
-                    ensure!((1..=10_000).contains(&network.fee_rate), "ETH fee_rate must be 1–10000 gwei/gas");
+                    network_ethereum::address::parse(&network.payout_address)?;
+                }
+                _ => bail!("unsupported network"),
+            }
+            ensure!(
+                (1..=32).contains(&network.max_peers),
+                "networks.{id}.max_peers must be 1–32"
+            );
+            match id.as_str() {
+                "ltc" | "btc" => ensure!(
+                    (1..=1000).contains(&network.fee_rate),
+                    "UTXO fee_rate must be 1–1000"
+                ),
+                "eth" => {
+                    ensure!(
+                        (1..=10_000).contains(&network.fee_rate),
+                        "ETH fee_rate must be 1–10000 gwei/gas"
+                    );
                     ensure!(network.max_peers >= 2, "ETH needs max_peers >= 2");
                 }
                 _ => bail!("unsupported network"),
@@ -82,7 +124,10 @@ impl Config {
             .networks
             .get(&key)
             .with_context(|| format!("Network `{key}` is not configured"))?;
-        ensure!(network.enabled, "Network `{key}` is disabled in config.json");
+        ensure!(
+            network.enabled,
+            "Network `{key}` is disabled in config.json"
+        );
         Ok(network)
     }
 }

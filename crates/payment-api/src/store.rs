@@ -1,21 +1,24 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
-use wallet_core::{vault::atomic_write, AddressTransaction};
+use wallet_core::{vault::atomic_write, AddressTransaction, Payment};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InvoiceStatus {
     /// Still accepting deposits (payend / max time not reached).
     Pending,
+    AwaitingConfirmation,
+    Underpaid,
     /// Payment window closed with funds — waiting for / doing auto-forward.
     Paid,
     Forwarded,
     ForwardFailed,
+    Forwarding,
     /// Window closed with no confirmed funds.
     Expired,
 }
@@ -58,6 +61,66 @@ pub struct Invoice {
     pub expires_unix: u64,
     #[serde(default)]
     pub transactions: Vec<InvoiceTx>,
+    #[serde(default)]
+    pub closed: bool,
+    #[serde(default)]
+    pub balance: u128,
+    #[serde(default)]
+    pub forwards: Vec<Forward>,
+    /// Startup must revalidate saved observations before authorizing an order.
+    #[serde(skip)]
+    pub verified: bool,
+    #[serde(default)]
+    pub legacy_forward_debit: Option<u128>,
+    /// Terminal receipt: retained for status reads, excluded from scanning.
+    #[serde(default)]
+    pub finished: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Forward {
+    pub payment: Payment,
+    pub confirmed: bool,
+    pub debit: u128,
+}
+
+impl Invoice {
+    pub fn payment_complete(&self) -> bool {
+        self.verified
+            && self.received > 0
+            && self
+                .expected_amount
+                .is_none_or(|expected| self.received >= expected)
+    }
+
+    fn refresh_status(&mut self) {
+        if self.finished {
+            return;
+        }
+        if !self.closed {
+            self.status = InvoiceStatus::Pending;
+        } else if self.forwards.iter().any(|forward| !forward.confirmed) {
+            self.status = InvoiceStatus::Forwarding;
+        } else if self.forward_error.is_some() {
+            self.status = InvoiceStatus::ForwardFailed;
+        } else if !self.payment_complete() {
+            self.status = if self.received > 0 {
+                InvoiceStatus::Underpaid
+            } else if self.received_unconfirmed > 0 {
+                InvoiceStatus::AwaitingConfirmation
+            } else {
+                InvoiceStatus::Expired
+            };
+        } else if self
+            .forwards
+            .last()
+            .is_some_and(|forward| forward.confirmed && self.balance < forward.payment.fee)
+        {
+            self.status = InvoiceStatus::Forwarded;
+        } else {
+            self.status = InvoiceStatus::Paid;
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -68,19 +131,39 @@ struct Envelope {
 pub struct Store {
     path: PathBuf,
     invoices: BTreeMap<String, Invoice>,
+    active: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Store {
     pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join("invoices.json");
-        let invoices = if path.exists() {
+        let mut invoices: BTreeMap<String, Invoice> = if path.exists() {
             let envelope: Envelope = serde_json::from_slice(&std::fs::read(&path)?)?;
             envelope.invoices
         } else {
             BTreeMap::new()
         };
-        Ok(Self { path, invoices })
+        let mut assigned = BTreeSet::new();
+        let mut active: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for invoice in invoices.values_mut() {
+            ensure!(assigned.insert((invoice.currency.clone(), invoice.address.clone())), "Multiple invoices share a receive address; reconcile these invoices before starting the gateway");
+            // Older versions encoded window closure only in status.
+            invoice.closed |= invoice.status != InvoiceStatus::Pending;
+            invoice.verified = invoice.finished;
+            invoice.refresh_status();
+            if !invoice.finished {
+                active
+                    .entry(invoice.currency.clone())
+                    .or_default()
+                    .insert(invoice.id.clone());
+            }
+        }
+        Ok(Self {
+            path,
+            invoices,
+            active,
+        })
     }
 
     fn save(&self) -> Result<()> {
@@ -92,6 +175,28 @@ impl Store {
         )
     }
 
+    fn change(
+        &mut self,
+        id: &str,
+        edit: impl FnOnce(&mut Invoice) -> Result<()>,
+    ) -> Result<Invoice> {
+        let previous = self.get(id)?;
+        let invoice = self.invoices.get_mut(id).context("Unknown invoice")?;
+        edit(invoice)?;
+        invoice.refresh_status();
+        let out = invoice.clone();
+        if let Err(error) = self.save() {
+            self.invoices.insert(id.to_owned(), previous);
+            return Err(error);
+        }
+        if out.finished {
+            if let Some(active) = self.active.get_mut(&out.currency) {
+                active.remove(id);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn create(
         &mut self,
         currency: &str,
@@ -99,6 +204,17 @@ impl Store {
         expected_amount: Option<u128>,
         max_payment_secs: u64,
     ) -> Result<Invoice> {
+        ensure!(
+            expected_amount != Some(0),
+            "Expected amount must be positive"
+        );
+        ensure!(
+            !self
+                .invoices
+                .values()
+                .any(|invoice| invoice.currency == currency && invoice.address == address),
+            "Receive address was already assigned to an invoice"
+        );
         let created_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -116,9 +232,22 @@ impl Store {
             created_unix,
             expires_unix: created_unix.saturating_add(max_payment_secs),
             transactions: Vec::new(),
+            closed: false,
+            balance: 0,
+            forwards: Vec::new(),
+            verified: false,
+            legacy_forward_debit: None,
+            finished: false,
         };
         self.invoices.insert(invoice.id.clone(), invoice.clone());
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.invoices.remove(&invoice.id);
+            return Err(error);
+        }
+        self.active
+            .entry(invoice.currency.clone())
+            .or_default()
+            .insert(invoice.id.clone());
         Ok(invoice)
     }
 
@@ -132,67 +261,87 @@ impl Store {
     /// Invoices that still need chain sync / balance updates / forwarding.
     pub fn pending_for(&self, currency: &str) -> Vec<Invoice> {
         let currency = currency.to_ascii_lowercase();
-        self.invoices
-            .values()
-            .filter(|invoice| {
-                invoice.currency == currency
-                    && matches!(
-                        invoice.status,
-                        InvoiceStatus::Pending
-                            | InvoiceStatus::Paid
-                            | InvoiceStatus::ForwardFailed
-                    )
-            })
+        self.active
+            .get(&currency)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.invoices.get(id))
             .cloned()
             .collect()
     }
 
     pub fn any_active(&self, currency: &str) -> bool {
-        !self.pending_for(currency).is_empty()
+        self.active
+            .get(&currency.to_ascii_lowercase())
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
+    /// Retire only after a current observation and resolution of known deposits
+    /// and payouts. Unknown future deposits do not reopen an archived invoice.
+    pub fn finish_if_settled(&mut self, id: &str) -> Result<bool> {
+        let invoice = self.get(id)?;
+        if invoice.finished {
+            return Ok(true);
+        }
+        let legacy_unresolved = invoice.forward_txid.is_some()
+            && invoice.forwards.is_empty()
+            && invoice.legacy_forward_debit.is_none();
+        let remainder_is_fee_dust = invoice
+            .forwards
+            .last()
+            .is_some_and(|forward| forward.confirmed && invoice.balance < forward.payment.fee);
+        if !invoice.closed
+            || !invoice.verified
+            || invoice.received_unconfirmed > 0
+            || invoice.forwards.iter().any(|forward| !forward.confirmed)
+            || legacy_unresolved
+            || (invoice.balance > 0 && !remainder_is_fee_dust)
+        {
+            return Ok(false);
+        }
+        self.change(id, |invoice| {
+            invoice.finished = true;
+            Ok(())
+        })?;
+        Ok(true)
     }
 
     pub fn update_observation(
         &mut self,
         id: &str,
         received: u128,
+        balance: u128,
         received_unconfirmed: u128,
         transactions: Vec<InvoiceTx>,
     ) -> Result<Invoice> {
-        let invoice = self.invoices.get_mut(id).context("Unknown invoice")?;
-        let dirty = invoice.received != received
-            || invoice.received_unconfirmed != received_unconfirmed
-            || invoice.transactions != transactions;
-        invoice.received = received;
-        invoice.received_unconfirmed = received_unconfirmed;
-        invoice.transactions = transactions;
-        // Do not auto-close on first receipt — payend / max time owns that.
-        let out = invoice.clone();
-        if dirty {
-            self.save()?;
+        let current = self.get(id)?;
+        if current.verified
+            && current.received == received
+            && current.balance == balance
+            && current.received_unconfirmed == received_unconfirmed
+            && current.transactions == transactions
+        {
+            return Ok(current);
         }
-        Ok(out)
+        self.change(id, |invoice| {
+            invoice.received = received;
+            invoice.balance = balance;
+            invoice.received_unconfirmed = received_unconfirmed;
+            invoice.transactions = transactions;
+            invoice.verified = true;
+            Ok(())
+        })
     }
 
     /// Close the payment window (API payend or max-time). Forwards only after this.
     pub fn end_payment(&mut self, id: &str) -> Result<Invoice> {
-        let invoice = self.invoices.get_mut(id).context("Unknown invoice")?;
-        match invoice.status {
-            InvoiceStatus::Pending => {
-                if invoice.received > 0 {
-                    invoice.status = InvoiceStatus::Paid;
-                    invoice.forward_error = None;
-                } else {
-                    invoice.status = InvoiceStatus::Expired;
-                }
-                let out = invoice.clone();
-                self.save()?;
-                Ok(out)
-            }
-            InvoiceStatus::Paid
-            | InvoiceStatus::Forwarded
-            | InvoiceStatus::ForwardFailed
-            | InvoiceStatus::Expired => Ok(invoice.clone()),
+        if self.get(id)?.closed {
+            return self.get(id);
         }
+        self.change(id, |invoice| {
+            invoice.closed = true;
+            Ok(())
+        })
     }
 
     pub fn expire_due(
@@ -207,7 +356,7 @@ impl Store {
             .invoices
             .values()
             .filter(|invoice| {
-                if invoice.currency != currency || invoice.status != InvoiceStatus::Pending {
+                if invoice.currency != currency || invoice.closed {
                     return false;
                 }
                 let expires = if invoice.expires_unix > 0 {
@@ -225,51 +374,71 @@ impl Store {
         Ok(ended)
     }
 
-    pub fn mark_forwarded(&mut self, id: &str, txid: String) -> Result<Invoice> {
-        let invoice = self.invoices.get_mut(id).context("Unknown invoice")?;
+    pub fn begin_forward(&mut self, id: &str, payment: Payment) -> Result<Invoice> {
+        let current = self.get(id)?;
         ensure!(
-            matches!(
-                invoice.status,
-                InvoiceStatus::Paid | InvoiceStatus::ForwardFailed
-            ),
-            "Invoice is not ready to forward"
+            current.closed && !current.forwards.iter().any(|forward| !forward.confirmed),
+            "Invoice already has an unresolved forward or is still open"
         );
-        invoice.status = InvoiceStatus::Forwarded;
-        invoice.forward_txid = Some(txid);
-        invoice.forward_error = None;
-        let out = invoice.clone();
-        self.save()?;
-        Ok(out)
+        self.change(id, |invoice| {
+            invoice.forward_txid = Some(payment.txid.clone());
+            invoice.forward_error = None;
+            invoice.forwards.push(Forward {
+                payment,
+                confirmed: false,
+                debit: 0,
+            });
+            Ok(())
+        })
+    }
+
+    pub fn reconcile_legacy_forward(&mut self, id: &str, debit: u128) -> Result<Invoice> {
+        self.change(id, |invoice| {
+            invoice.legacy_forward_debit = Some(debit);
+            invoice.forward_error = None;
+            Ok(())
+        })
+    }
+
+    pub fn confirm_forward(&mut self, id: &str, txid: &str, debit: u128) -> Result<Invoice> {
+        self.change(id, |invoice| {
+            let forward = invoice
+                .forwards
+                .iter_mut()
+                .find(|forward| forward.payment.txid == txid)
+                .context("Unknown forward")?;
+            forward.confirmed = true;
+            forward.debit = debit;
+            invoice.forward_error = None;
+            Ok(())
+        })
+    }
+
+    pub fn unconfirm_forward(&mut self, id: &str, txid: &str) -> Result<Invoice> {
+        self.change(id, |invoice| {
+            let forward = invoice
+                .forwards
+                .iter_mut()
+                .find(|forward| forward.payment.txid == txid)
+                .context("Unknown forward")?;
+            forward.confirmed = false;
+            forward.debit = 0;
+            Ok(())
+        })
     }
 
     pub fn mark_forward_failed(&mut self, id: &str, error: String) -> Result<()> {
-        let invoice = self.invoices.get_mut(id).context("Unknown invoice")?;
-        if invoice.status == InvoiceStatus::Paid || invoice.status == InvoiceStatus::ForwardFailed {
-            invoice.status = InvoiceStatus::ForwardFailed;
-            invoice.forward_error.replace(error);
-            self.save()?;
+        if self.get(id)?.forward_error.as_deref() == Some(error.as_str()) {
+            return Ok(());
         }
+        self.change(id, |invoice| {
+            invoice.forward_error = Some(error);
+            Ok(())
+        })?;
         Ok(())
     }
 
     pub fn payend(&mut self, id: &str) -> Result<Invoice> {
-        let invoice = self.get(id)?;
-        if invoice.status != InvoiceStatus::Pending {
-            bail!(
-                "Invoice `{id}` is already {} — payend only applies while pending",
-                status_label(&invoice.status)
-            );
-        }
         self.end_payment(id)
-    }
-}
-
-fn status_label(status: &InvoiceStatus) -> &'static str {
-    match status {
-        InvoiceStatus::Pending => "pending",
-        InvoiceStatus::Paid => "paid",
-        InvoiceStatus::Forwarded => "forwarded",
-        InvoiceStatus::ForwardFailed => "forward_failed",
-        InvoiceStatus::Expired => "expired",
     }
 }

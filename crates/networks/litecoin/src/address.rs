@@ -54,6 +54,48 @@ pub fn script_for_address(address: &str) -> Result<ScriptBuf> {
 mod tests {
     use super::*;
     #[test]
+    fn recipient_type_matrix() {
+        for (version, length, opcode) in [(0, 20, 0), (0, 32, 0), (1, 32, 0x51)] {
+            let program = vec![42; length];
+            let text = segwit::encode(
+                Hrp::parse("ltc").unwrap(),
+                bech32::Fe32::try_from(version).unwrap(),
+                &program,
+            )
+            .unwrap();
+            let expected = ScriptBuf::from_bytes([vec![opcode, length as u8], program].concat());
+            assert_eq!(script_for_address(&text).unwrap(), expected);
+            assert_eq!(
+                script_for_address(&text.to_ascii_uppercase()).unwrap(),
+                expected
+            );
+            assert!(script_for_address(&format!("LTC{}", &text[3..])).is_err());
+        }
+        let hash = vec![42; 20];
+        for prefix in [48, 50, 5] {
+            let text = bs58::encode([vec![prefix], hash.clone()].concat())
+                .with_check()
+                .into_string();
+            let expected = if prefix == 48 {
+                [&[0x76, 0xa9, 20][..], &hash, &[0x88, 0xac]].concat()
+            } else {
+                [&[0xa9, 20][..], &hash, &[0x87]].concat()
+            };
+            assert_eq!(script_for_address(&text).unwrap().as_bytes(), expected);
+        }
+        for prefix in [0, 111, 58] {
+            let text = bs58::encode([vec![prefix], hash.clone()].concat())
+                .with_check()
+                .into_string();
+            assert!(script_for_address(&text).is_err());
+        }
+        let testnet = segwit::encode_v0(Hrp::parse("tltc").unwrap(), &hash).unwrap();
+        assert!(script_for_address(&testnet).is_err());
+        assert!(script_for_address("ltc1mwebexample").is_err());
+        assert!(script_for_address("litecoin:Lexample").is_err());
+    }
+
+    #[test]
     fn litecoin_derivation_and_address_boundaries() {
         let master = Xpriv::new_master(bitcoin::NetworkKind::Main, &[0u8; 64]).unwrap();
         let (_, script, address) = derive(&master, false, 0).unwrap();

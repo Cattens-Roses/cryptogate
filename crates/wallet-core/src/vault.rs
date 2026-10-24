@@ -16,6 +16,7 @@ use std::{
 use zeroize::Zeroizing;
 
 const AAD: &[u8] = b"enginecore/vault/v1";
+const RANDOM_SEED_AAD: &[u8] = b"enginecore/vault/v2";
 
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -31,6 +32,51 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// Unattended gateway vault: encrypt a random seed directly, without
+    /// generating recovery words. Back up the vault file and its password.
+    pub fn create_random(dir: &Path, password: &str) -> Result<Self> {
+        if password.chars().count() < 10 {
+            bail!("Use a password of at least 10 characters");
+        }
+        fs::create_dir_all(dir)?;
+        let lock = lock(dir)?;
+        let mut seed = Zeroizing::new([0u8; 64]);
+        let mut salt = [0u8; 16];
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(seed.as_mut());
+        OsRng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut nonce);
+        let key = derive_key(password, &salt)?;
+        let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+            .map_err(|_| anyhow!("Cipher initialization failed"))?;
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: seed.as_ref(),
+                    aad: RANDOM_SEED_AAD,
+                },
+            )
+            .map_err(|_| anyhow!("Encryption failed"))?;
+        let envelope = Envelope {
+            version: 2,
+            salt: hex::encode(salt),
+            nonce: hex::encode(nonce),
+            ciphertext: hex::encode(ciphertext),
+        };
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(dir.join("vault.json"))?;
+        file.write_all(&serde_json::to_vec_pretty(&envelope)?)?;
+        file.sync_all()?;
+        Ok(Self { seed, _lock: lock })
+    }
+
     /// Mnemonic is shown once; it is never stored unencrypted.
     pub fn create(
         dir: &Path,
@@ -95,7 +141,7 @@ impl Vault {
             bail!("Vault file is too large");
         }
         let envelope: Envelope = serde_json::from_slice(&fs::read(path)?)?;
-        if envelope.version != 1 {
+        if !matches!(envelope.version, 1 | 2) {
             bail!("Unsupported vault format");
         }
         let salt = hex::decode(envelope.salt)?;
@@ -112,16 +158,27 @@ impl Vault {
                     Nonce::from_slice(&nonce),
                     Payload {
                         msg: &hex::decode(envelope.ciphertext)?,
-                        aad: AAD,
+                        aad: if envelope.version == 1 {
+                            AAD
+                        } else {
+                            RANDOM_SEED_AAD
+                        },
                     },
                 )
                 .map_err(|_| anyhow!("Wrong password or damaged vault"))?,
         );
-        let mnemonic = Mnemonic::parse(std::str::from_utf8(&plaintext)?)?;
-        Ok(Self {
-            seed: Zeroizing::new(mnemonic.to_seed("")),
-            _lock: lock,
-        })
+        let seed = if envelope.version == 1 {
+            let mnemonic = Mnemonic::parse(std::str::from_utf8(&plaintext)?)?;
+            Zeroizing::new(mnemonic.to_seed(""))
+        } else {
+            Zeroizing::new(
+                plaintext
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid random seed length"))?,
+            )
+        };
+        Ok(Self { seed, _lock: lock })
     }
 
     pub fn seed(&self) -> &[u8; 64] {
@@ -184,6 +241,27 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn random_seed_vault_roundtrip_lock_and_version_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::create_random(dir.path(), "a long test password").unwrap();
+        let seed = *vault.seed();
+        assert_ne!(seed, [0; 64]);
+        assert!(Vault::open(dir.path(), "a long test password").is_err());
+        drop(vault);
+        assert!(Vault::open(dir.path(), "wrong password").is_err());
+        let vault = Vault::open(dir.path(), "a long test password").unwrap();
+        assert_eq!(*vault.seed(), seed);
+        drop(vault);
+        assert!(Vault::create_random(dir.path(), "a long test password").is_err());
+        let path = dir.path().join("vault.json");
+        let mut envelope: Envelope = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(envelope.version, 2);
+        envelope.version = 1;
+        fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert!(Vault::open(dir.path(), "a long test password").is_err());
+    }
+
     #[test]
     fn vault_roundtrip_lock_password_and_tamper() {
         let dir = tempfile::tempdir().unwrap();

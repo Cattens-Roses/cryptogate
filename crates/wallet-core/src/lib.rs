@@ -52,7 +52,7 @@ pub struct Snapshot {
 }
 
 /// Immutable review of a signed payment. Broadcast requires a separate explicit action.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Payment {
     pub recipient: String,
     pub amount: u128,
@@ -69,6 +69,11 @@ pub trait Network: Send {
     fn next_address(&mut self) -> Result<String>;
     fn sync_step(&mut self, cancel: &AtomicBool) -> Result<bool>;
     fn disconnect(&mut self);
+    /// Gateway account queries can be limited to invoices still being settled.
+    /// None of the TUI flows call this; their normal discovery is unchanged.
+    fn set_active_addresses(&mut self, _addresses: &[String]) -> Result<()> {
+        Ok(())
+    }
     /// Drain optional, unconfirmed relay observations without blocking network I/O.
     fn poll_activity(&mut self) -> Result<bool> {
         Ok(false)
@@ -80,6 +85,48 @@ pub trait Network: Send {
     }
     fn prepare_payment(&mut self, recipient: &str, amount: u128, fee_rate: u64) -> Result<Payment>;
     fn broadcast(&mut self, payment: &Payment, cancel: &AtomicBool) -> Result<()>;
+    /// Retry exactly the same signed payment after an interrupted gateway send.
+    /// Implementations must validate ownership and preserve existing reservations.
+    fn resume_broadcast(&mut self, _payment: &Payment, _cancel: &AtomicBool) -> Result<()> {
+        bail!("Resuming broadcasts is not supported on this network")
+    }
+    /// Recover pre-journal gateway sends from the wallet's own reservations.
+    fn saved_payment(&self, _txid: &str, _recipient: &str) -> Option<Payment> {
+        None
+    }
+    fn payment_confirmations(&self, txid: &str) -> u32 {
+        let snapshot = self.snapshot();
+        snapshot
+            .transactions
+            .iter()
+            .find(|tx| tx.txid == txid && tx.height > 0)
+            .map(|tx| snapshot.height.saturating_sub(tx.height) + 1)
+            .unwrap_or(0)
+    }
+    /// Actual confirmed debit, including the fee (not an Ethereum fee cap).
+    fn payment_debit(&self, txid: &str) -> Option<u128> {
+        self.snapshot()
+            .transactions
+            .iter()
+            .find(|tx| tx.txid == txid && tx.height > 0)
+            .map(|tx| tx.sent)
+    }
+    /// Cumulative deposits; UTXO backends override this using retained proofs.
+    fn address_received(&self, address: &str) -> Option<u128> {
+        self.address_balances()
+            .into_iter()
+            .find(|(a, _)| a == address)
+            .map(|(_, value)| value)
+    }
+    /// Deposits deep enough to authorize merchant fulfillment.
+    fn address_credited(&self, address: &str) -> Option<u128> {
+        self.address_received(address)
+    }
+    /// Account networks can have a fresh proof for one invoice while other
+    /// addresses are still being queried. UTXO networks require full backfill.
+    fn address_is_current(&self, _address: &str) -> bool {
+        false
+    }
     /// Confirmed balances keyed by receive address (payment gateways).
     fn address_balances(&self) -> Vec<(String, u128)> {
         let snap = self.snapshot();

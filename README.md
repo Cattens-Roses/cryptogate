@@ -80,7 +80,7 @@ Use a terminal of at least 64 columns × 24 rows. Balances, receive address, hea
 
 ## Payment API
 
-Separate long-running HTTP service (not the TUI). Chains stay **idle** until an invoice exists; multiple invoices on one currency share **one** scanner. The payment window stays open for further deposits until `POST /api/payend/{id}` or `max_payment_secs`; then confirmed funds auto-forward to `payout_address` (≥6 confirmations on LTC/BTC).
+Separate long-running HTTP service (not the TUI). Chains stay **idle** until an invoice exists; multiple invoices on one currency share **one** wallet and scanner. The payment window closes at `POST /api/payend/{id}` or `max_payment_secs`; known deposits and payouts awaiting confirmation remain active until settled. Finished invoices are archived without further scanning; when no active invoices remain, the scanner disconnects. Create a new invoice for each later payment. Authorize orders using `payment_complete`: the full expected amount must be credited (at least six confirmations on BTC/LTC, finalized state proofs on ETH). Signed payouts are journaled before relay and retried with the same transaction ID after interruption. Raw monetary API fields are exact decimal strings. New gateway vaults encrypt random seeds without creating recovery phrases; back up the complete data directory and vault password.
 
 Full reference: **[docs/payment-api.md](docs/payment-api.md)**.
 

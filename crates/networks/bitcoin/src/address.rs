@@ -43,6 +43,46 @@ pub fn script_for_address(address: &str) -> Result<ScriptBuf> {
 mod tests {
     use super::*;
     #[test]
+    fn recipient_type_matrix() {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let public = PublicKey::from_secret_key(&secp, &key);
+        let compressed = CompressedPublicKey(public);
+        let witness_script = ScriptBuf::from_bytes(vec![0x51]);
+        let addresses = [
+            Address::p2pkh(compressed, Network::Bitcoin),
+            Address::p2sh(&witness_script, Network::Bitcoin).unwrap(),
+            Address::p2wpkh(&compressed, Network::Bitcoin),
+            Address::p2wsh(&witness_script, Network::Bitcoin),
+            Address::p2tr(&secp, public.x_only_public_key().0, None, Network::Bitcoin),
+        ];
+        for address in addresses {
+            let text = address.to_string();
+            assert_eq!(
+                script_for_address(&text).unwrap(),
+                address.script_pubkey(),
+                "{text}"
+            );
+            if text.starts_with("bc1") {
+                assert_eq!(
+                    script_for_address(&text.to_ascii_uppercase()).unwrap(),
+                    address.script_pubkey()
+                );
+                let mixed = format!("BC{}", &text[2..]);
+                assert!(script_for_address(&mixed).is_err());
+            }
+        }
+        for text in [
+            "",
+            "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            "sp1example",
+            "0x52908400098527886E0F7030069857D2E4169EE7",
+        ] {
+            assert!(script_for_address(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn mainnet_address_checks_and_derivation_are_network_specific() {
         let master = Xpriv::new_master(bitcoin::NetworkKind::Main, &[0; 64]).unwrap();
         let (_, script, address) = derive(&master, false, 0).unwrap();
